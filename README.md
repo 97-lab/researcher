@@ -116,6 +116,3 @@ python main.py
 - 多 Agent：把一个大主题拆成多个子主题并行研究
 - LangGraph Studio 可视化运行
 
-## 提醒
-
-`.env` 里包含敏感信息（API key），已通过 `.gitignore` 忽略，请勿提交到 GitHub。
