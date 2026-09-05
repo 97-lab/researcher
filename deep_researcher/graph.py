@@ -15,7 +15,9 @@ from .prompts import (
 )
 from .configuration import (
     MAX_LOOPS,
-    LOCAL_LLM,
+    QUERY_LLM,
+    SUMMARIZE_LLM,
+    REFLECT_LLM,
     SEARCH_MAX_RESULTS,
     SEARCH_KEEP_RESULTS,
     RELEVANCE_RATIO,
@@ -29,8 +31,9 @@ class DeepResearcher(StateGraph):
 
     def __init__(self):
         super().__init__(State)  #把State传给StateGraph
-        self.llm = ChatOllama(model=LOCAL_LLM, temperature=0)
-        self.llm_json = ChatOllama(model=LOCAL_LLM, temperature=0, format="json")
+        self.summarize_llm = ChatOllama(model=SUMMARIZE_LLM, temperature=0)
+        self.query_llm_json = ChatOllama(model=QUERY_LLM, temperature=0, format="json")
+        self.reflect_llm_json = ChatOllama(model=REFLECT_LLM, temperature=0, format="json")
         self.tools = WebResearchTools(
             max_results=SEARCH_MAX_RESULTS,
             keep=SEARCH_KEEP_RESULTS,
@@ -55,7 +58,9 @@ class DeepResearcher(StateGraph):
         )
         self.add_edge("finalize_summary", END)
 
-    def generate_search_query_with_structured_output(self,
+    def generate_search_query_with_structured_output(
+        self,
+        llm,
         system_prompt: str,
         human_message: str,
         model_class,
@@ -67,7 +72,7 @@ class DeepResearcher(StateGraph):
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_message),
         ]
-        response = self.llm_json.invoke(messages)
+        response = llm.invoke(messages)
 
         query = ""
         import json
@@ -91,6 +96,7 @@ class DeepResearcher(StateGraph):
             + json_mode_query_instructions
         )
         query = self.generate_search_query_with_structured_output(
+            llm=self.query_llm_json,
             system_prompt=formatted_prompt,
             human_message="请根据研究主题生成搜索词：",
             model_class=Query,
@@ -118,6 +124,7 @@ class DeepResearcher(StateGraph):
         return {
             "search_results": "\n\n".join(lines),
             "sources_gathered": source_lines,
+            "searched_queries": [state.search_query],
             "research_loop_count": state.research_loop_count + 1,
         }
 
@@ -133,7 +140,7 @@ class DeepResearcher(StateGraph):
                 f"<资料>\n{state.search_results}\n</资料>\n\n"
                 f"请根据资料创建总结（主题：{state.research_topic}）"
             )
-        response = self.llm.invoke([
+        response = self.summarize_llm.invoke([
             SystemMessage(content=summarizer_instructions),
             HumanMessage(content=human),
         ])
@@ -147,6 +154,7 @@ class DeepResearcher(StateGraph):
             + json_mode_reflection_instructions
         )
         new_query = self.generate_search_query_with_structured_output(
+            llm=self.reflect_llm_json,
             system_prompt=formatted_prompt,
             human_message=(
                 f"当前总结如下：\n{state.summary}\n\n"

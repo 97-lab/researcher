@@ -76,27 +76,25 @@ json_mode_reflection_instructions = """<输出格式>
 不要输出 JSON 以外的任何内容，不要使用 Markdown 代码块。"""
 
 
-intent_parser_instructions = """你是一个命令解析器，把用户的话转成 JSON。
-
-<用户消息>
-{user_message}
-</用户消息>
+intent_parser_instructions = """你是一个命令解析器，把用户最后说的话转成 JSON。
 
 动作说明：
-- new_research：用户想研究一个新主题
-- view：用户想查看某个分支的当前研究结果
+- new_research：用户想研究一个新主题（包括“什么是X”“解释一下X”“帮我研究X”）
+- view：用户想查看某个已存在的分支（用户会明确提到 r1、r2 这种编号）
 - follow_up：用户想回到某个分支，对某一轮搜索词追问
 - exit：用户想退出
 
-字段：
-- action：动作名
-- researcher_id：分支编号，如 r1（用户提到才填）
-- topic：研究主题（new_research 时必填）
-- query_index：追问第几个搜索词，从 1 开始（follow_up 时填）
-- follow_up：追问内容（follow_up 时填）
+字段规则：
+- researcher_id：只在用户明确提到 r1/r2 这类编号时填写，否则一律留空
+- topic：new_research 时填研究主题；其他情况留空
+- query_index：追问第几个搜索词，从 1 开始；其他情况填 0
+- follow_up：追问内容；其他情况留空
 
 示例：
 用户：帮我研究一下圆周率
+输出：{{"action": "new_research", "topic": "圆周率", "researcher_id": "", "query_index": 0, "follow_up": ""}}
+
+用户：什么是圆周率
 输出：{{"action": "new_research", "topic": "圆周率", "researcher_id": "", "query_index": 0, "follow_up": ""}}
 
 用户：看看 r1 的研究结果
@@ -108,7 +106,6 @@ intent_parser_instructions = """你是一个命令解析器，把用户的话转
 用户：不研究了
 输出：{{"action": "exit", "researcher_id": "", "topic": "", "query_index": 0, "follow_up": ""}}
 """
-
 json_mode_intent_instructions = """<输出格式>
 必须只输出一个 JSON 对象，包含五个字段：
 - "action"

@@ -1,6 +1,5 @@
 from tavily import TavilyClient
-from 复刻1.deep_researcher.configuration import SEARCH_API, TAVILY_API_KEY
-
+from .configuration import SEARCH_API, TAVILY_API_KEY
 
 class WebResearchTools:
     """封装网页研究相关的工具：搜索、相关性过滤、来源去重。"""
@@ -60,7 +59,7 @@ class WebResearchTools:
             return False
         text_chars = set(text.replace(" ", ""))
         overlap = len(topic_chars & text_chars)
-        threshold = max(3, int(len(topic_chars) * self.ratio))
+        threshold = max(1, int(len(topic_chars) * self.ratio))
         return overlap >= threshold
 
     def deduplicate(self, source_lines: list) -> str:

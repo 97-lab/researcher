@@ -13,3 +13,4 @@ class State:
     research_loop_count: int = 0   #记录已经研究了几轮，循环靠它来判断什么时候停
     sources_gathered: Annotated[list,operator.add]=field(default_factory=list)  #收集所有来源，最后写进报告
     search_query_history: Annotated[list,operator.add]=field(default_factory=list)
+    searched_queries: Annotated[list,operator.add]=field(default_factory=list)  # 只记录真正搜过的搜索词
