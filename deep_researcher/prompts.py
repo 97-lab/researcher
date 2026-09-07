@@ -80,15 +80,18 @@ intent_parser_instructions = """你是一个命令解析器，把用户最后说
 
 动作说明：
 - new_research：用户想研究一个新主题（包括“什么是X”“解释一下X”“帮我研究X”）
-- view：用户想查看某个已存在的分支（用户会明确提到 r1、r2 这种编号）
-- follow_up：用户想回到某个分支，对某一轮搜索词追问
+- view：用户想查看某个分支当前最新结果（用户会明确提到 r1、r2 这种编号）
+- follow_up：用户想回到某个分支，对某一轮搜索词追问（会提到“第几轮”“搜索词”“追问”“重点查”）
+- recall：用户想检索某个分支的“历史版本/旧版本”记忆（会提到“以前”“旧版本”“覆盖前”“之前总结过”）
 - exit：用户想退出
+
 
 字段规则：
 - researcher_id：只在用户明确提到 r1/r2 这类编号时填写，否则一律留空
 - topic：new_research 时填研究主题；其他情况留空
 - query_index：追问第几个搜索词，从 1 开始；其他情况填 0
 - follow_up：追问内容；其他情况留空
+- action 为 recall 时：只填 researcher_id（用户提到分支编号才填），不要填 topic 和 follow_up，主程序会直接用用户原话去检索
 
 示例：
 用户：帮我研究一下圆周率
@@ -105,6 +108,13 @@ intent_parser_instructions = """你是一个命令解析器，把用户最后说
 
 用户：不研究了
 输出：{{"action": "exit", "researcher_id": "", "topic": "", "query_index": 0, "follow_up": ""}}
+
+用户：r4 以前对精度的总结是什么？
+输出：{"action": "recall", "researcher_id": "r4", "topic": "", "query_index": 0, "follow_up": ""}
+
+用户：哪个分支以前研究过祖冲之的精度？
+输出：{"action": "recall", "researcher_id": "", "topic": "", "query_index": 0, "follow_up": ""}
+
 """
 json_mode_intent_instructions = """<输出格式>
 必须只输出一个 JSON 对象，包含五个字段：

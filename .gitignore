@@ -7,3 +7,4 @@ __pycache__/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+memory_store/

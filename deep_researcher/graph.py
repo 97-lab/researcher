@@ -140,11 +140,23 @@ class DeepResearcher(StateGraph):
                 f"<资料>\n{state.search_results}\n</资料>\n\n"
                 f"请根据资料创建总结（主题：{state.research_topic}）"
             )
-        response = self.summarize_llm.invoke([
+        messages = [
             SystemMessage(content=summarizer_instructions),
             HumanMessage(content=human),
-        ])
-        return {"summary": response.content}
+        ]
+
+        print("\n[模型生成中]\n", flush=True)
+
+        pieces = []
+        for chunk in self.summarize_llm.stream(messages):
+            # chunk.content 可能被切成多个片段，逐个打印
+            text = chunk.content if chunk.content else ""
+            print(text, end="", flush=True)
+            pieces.append(text)
+
+        print("\n", flush=True)
+
+        return {"summary": "".join(pieces)}
 
     def reflect_on_summary(self, state):
         formatted_prompt = (

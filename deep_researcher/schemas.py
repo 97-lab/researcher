@@ -11,7 +11,7 @@ class FollowUpQuery(BaseModel):
 
 
 class UserIntent(BaseModel):
-    action: str = Field(description="动作：new_research / view / follow_up / exit / unknown")
+    action: str = Field(description="动作：new_research / view / follow_up /recall/ exit / unknown")
     researcher_id: str = Field(default="", description="分支编号，如 r1")
     topic: str = Field(default="", description="研究主题")
     query_index: int = Field(default=0, description="追问第几个搜索词，从 1 开始")

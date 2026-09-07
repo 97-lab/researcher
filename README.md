@@ -1,118 +1,201 @@
-# 本地深度研究员
+# 本地深度研究员（Local Deep Researcher）
 
-一个完全本地运行的深度研究助手：输入一句话，它会自动搜索资料、阅读总结、反思盲区、继续追问，最后产出一份带参考来源的研究报告。
+一个跑在本地、用自然语言指挥的“研究者 Agent”。你给它一个研究主题，它会自动搜索网络资料，多轮搜索、总结、反思，最终产出一份带参考来源的研究报告。
 
-本项目从 [langchain-ai/local-deep-researcher](https://github.com/langchain-ai/local-deep-researcher) 复刻并逐步改造，全部模型跑在本地 Ollama，不需要云端 API。
+本项目是一个学习型复刻项目，研究循环参考了 [langchain-ai/local-deep-researcher](https://github.com/langchain-ai/local-deep-researcher)，并在其基础上扩展了两套记忆能力：
 
-## 现在能做什么
+- **分支记忆 + 时间旅行**：每次研究是一个独立分支（r1、r2…），你可以回到任意一轮搜索之前，换一个问题重新研究，产生新版本；
+- **RAG 版本记忆**：每个版本都会被向量化存档，覆盖后你依然能用一句自然语言找回“旧版本说过什么”。
 
-- **自然语言交互**：直接说话，程序里的模型负责理解你的意图
-- **自动研究**：生成搜索词 → 搜索 → 总结 → 反思 → 再搜，最多 3 轮
-- **带引用的报告**：总结后面跟着用过的参考来源链接
-- **分支管理**：每次研究是一个分支（r1、r2…），可以随时查看
-- **追问重跑**：对分支的某一轮搜索词追问，程序会回到那一轮、换新词重新研究
-- **时间旅行**：每一步状态自动存入 SQLite，可恢复到任意历史时间点
-- **结构化输出**：模型必须填 JSON 字段，格式稳定，坏输出自动走兜底
+## 功能一览
 
-## 技术栈
+- 完全本地的对话模型（Ollama），不需要任何云端 LLM
+- LangGraph 反思循环：`搜索 → 总结 → 反思 → 继续搜索或收尾`
+- Tavily 联网搜索 + 相关性过滤 + 来源去重
+- 自然语言指令解析：新研究 / 查看 / 追问 / 历史记忆检索 / 退出
+- 流式输出：总结生成时逐字显示，不用等全部生成完
+- 所有状态本地持久化：SQLite（检查点 + 分支）+ Chroma（RAG 历史版本）
 
-| 组件 | 作用 |
-|---|---|
-| Python + LangGraph | 把研究流程组织成状态图 |
-| Ollama + deepseek-r1:8b | 本地推理模型：生成搜索词、总结、反思 |
-| Ollama + qwen2.5:3b | 本地轻量模型：解析用户意图 |
-| Tavily / Bing | 搜索引擎 |
-| SQLite | checkpoint 时间旅行存档 + 分支登记表 |
+## 项目结构
 
-## 快速开始
+```
+.
+├── main.py                      # 入口：自然语言对话循环
+├── branch_store.py              # 分支当前版本表（SQLite）
+├── requirements.txt
+├── .env.example                 # 环境变量模板
+├── deep_researcher/
+│   ├── graph.py                 # LangGraph 图：节点与流转
+│   ├── state.py                 # 图状态定义
+│   ├── configuration.py         # 从 .env 读取配置
+│   ├── tools.py                 # Tavily 搜索 + 相关性过滤
+│   ├── memory.py                # RAG 记忆：remember / recall
+│   ├── schemas.py               # 结构化输出模型
+│   ├── prompts.py               # 各节点的提示词
+│   └── utils.py                 # 搜索词校验等小工具
+└── test_scripts/
+    ├── memory_test.py           # RAG 记忆独立测试
+    └── test_json.py             # JSON 输出解析测试
+```
 
-### 1. 安装依赖
+## 工作原理
+
+### 1. 研究循环
+
+一个分支的研究流程如下：
+
+```
+生成搜索词
+    ↓
+联网搜索（Tavily）
+    ↓
+总结已有资料
+    ↓
+反思：总结还缺什么？
+    ↓
+还有知识盲区 → 回到“联网搜索”
+总结已完整 → 附上参考来源，收尾
+```
+
+循环次数由 `MAX_WEB_RESEARCH_LOOPS` 控制。
+
+### 2. 分支与时间旅行
+
+每次新研究生成一个 `researcher_id`（如 r1）。LangGraph 的 SQLite 检查点会保留整条历史时间线，因此你可以说“回到 r1 第 2 轮，重点查祖冲之的算法”，程序会把那一轮搜索词替换成你的新问题，再从这个时间点往后重跑。
+
+### 3. RAG 版本记忆
+
+每个分支的每个研究结果（搜索词 + 总结）都会同时写入两处：
+
+- `branches.sqlite`：只保留该分支的最新版本；
+- `memory_store/`（Chroma 向量库）：追加保存全部历史版本。
+
+检索时程序用你的原话做语义搜索，默认相关度阈值 `0.3`，把无关旧记忆过滤掉。
+
+## 环境要求
+
+- Windows / macOS / Linux，Python 3.10+
+- [Ollama](https://ollama.com) 已安装并运行
+- Tavily API Key（[注册获取](https://tavily.com)）
+
+## 安装与运行
+
+### 1. 拉取本地模型
 
 ```bash
+ollama pull qwen2.5:3b
+ollama pull qwen3-embedding:0.6b
+```
+
+`qwen2.5:3b` 用于意图解析、搜索词生成、总结；`qwen3-embedding:0.6b` 用于把历史版本转成向量。想换更强的总结模型也可以 `ollama pull qwen2.5:7b` 后改 `.env`。
+
+### 2. 安装依赖
+
+```bash
+python -m venv .venv
+```
+
+Windows：
+
+```powershell
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. 配置 `.env`
-
-参考 `.env.example`，在项目根目录建 `.env`：
-
-```ini
-LOCAL_LLM=deepseek-r1:8b
-INTENT_LLM=qwen2.5:3b
-SEARCH_API=tavily
-TAVILY_API_KEY=tvly-你的key
-```
-
-- 用 Tavily 搜索（推荐）：去 [tavily.com](https://tavily.com) 注册，把 key 填进 `TAVILY_API_KEY`；更安全的做法是设成系统环境变量
-- 用 Bing 搜索：把 `SEARCH_API` 改成 `bing`（不需要 key）
-
-### 3. 拉取本地模型
+macOS / Linux：
 
 ```bash
-ollama pull deepseek-r1:8b
-ollama pull qwen2.5:3b
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 4. 运行
+### 3. 配置环境变量
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，至少填写：
+
+```ini
+TAVILY_API_KEY=你的key
+EMBEDDING_MODEL=qwen3-embedding:0.6b
+```
+
+常用变量：
+
+| 变量 | 作用 | 示例 |
+|---|---|---|
+| `TAVILY_API_KEY` | 联网搜索密钥 | `tvly-xxxx` |
+| `OLLAMA_BASE_URL` | Ollama 服务地址 | `http://localhost:11434` |
+| `INTENT_LLM` | 自然语言意图解析 | `qwen2.5:3b` |
+| `QUERY_LLM` | 生成搜索词 | `qwen2.5:3b` |
+| `SUMMARIZE_LLM` | 生成/整合总结 | `qwen2.5:3b` |
+| `REFLECT_LLM` | 反思总结、找知识盲区 | `qwen2.5:3b` |
+| `EMBEDDING_MODEL` | RAG 记忆向量模型 | `qwen3-embedding:0.6b` |
+| `MAX_WEB_RESEARCH_LOOPS` | 单个分支最多研究轮数 | `3` |
+| `RELEVANCE_RATIO` | 搜索结果相关性过滤强度 | `0.3` |
+
+> 注意：`.env` 里的变量不要写成空值。例如 `EMBEDDING_MODEL=` 会覆盖代码里的默认值，导致“模型名为空”的报错。
+
+### 4. 启动
 
 ```bash
 python main.py
 ```
 
-直接输入自然语言，例如：
+## 怎么和它对话
 
-```text
-你想做什么？：帮我研究一下圆周率
-（创建分支 r1，自动搜索、总结、反思，最后打印报告）
-
-你想做什么？：看看 r1
-（查看 r1 当前版本的搜索词和总结）
-
-你想做什么？：回到 r1 第2轮，重点查祖冲之的算法
-（回到 r1 的第 2 轮搜索前，换新词重跑后面的流程）
-
-你想做什么？：退出
-```
-
-## 项目结构
-
-```text
-复刻1/
-├── main.py                    # 程序入口：自然语言交互
-├── branch_store.py            # 分支登记表（r1/r2… 当前版本）
-├── deep_researcher/           # 核心代码包
-│   ├── graph.py               # 研究流程图（DeepResearcher）
-│   ├── state.py               # 流程状态
-│   ├── schemas.py             # 结构化输出的数据契约
-│   ├── prompts.py             # 提示词
-│   ├── configuration.py       # 读取 .env 配置
-│   ├── tools.py               # 搜索工具（Tavily / Bing）
-│   └── utils.py               # 通用小工具
-├── test_scripts/              # 测试脚本
-├── .env.example               # 配置示例（可提交）
-├── requirements.txt           # 依赖清单
-└── README.md
-```
-
-## 数据文件说明
-
-运行时会在项目根目录自动生成两个文件（已加入 `.gitignore`，不会上传）：
-
-| 文件 | 作用 |
+| 你想做什么 | 这样说 |
 |---|---|
-| `research.sqlite` | 每一步状态快照，时间旅行的存档 |
-| `branches.sqlite` | 分支登记表，记录每个分支的当前版本 |
+| 新研究 | 帮我研究一下圆周率的计算历史 |
+| 查看分支当前结果 | 看看 r1 的研究结果 |
+| 回到历史时间点追问 | 回到 r1 第1轮，重点查祖冲之的算法 |
+| 找回被覆盖的旧版本 | r1 以前对精度的总结是什么 |
+| 退出 | 退出 |
+
+解析完成后程序会先打印一行：
+
+```
+解析结果: {'action': 'recall', 'researcher_id': 'r1', ...}
+```
+
+你可以据此判断系统把你的话理解成了哪种操作。
+
+## 本地会生成哪些数据文件
+
+| 文件 / 目录 | 作用 |
+|---|---|
+| `research.sqlite` | LangGraph 检查点，支撑时间旅行 |
+| `branches.sqlite` | 分支当前版本 |
+| `memory_store/` | Chroma 向量库，保存所有历史版本 |
+| `.env` | 你的私密配置 |
+
+这些文件都已经加入 `.gitignore`，不会被推送到 GitHub。
 
 ## 常见问题
 
-- `WinError 10061 连接被拒绝`：Ollama 没启动，先打开 Ollama 应用
-- `model not found`：模型没拉全，执行上面第 3 步
-- 意图解析慢：把 `INTENT_LLM` 换成更小的模型
-- Tavily 报 401：`TAVILY_API_KEY` 填错了
+### Ollama 提示模型找不到
 
-## 规划中
+```bash
+ollama pull qwen2.5:3b
+ollama pull qwen3-embedding:0.6b
+```
 
-- RAG 记忆：让模型能“回忆”被覆盖掉的旧版本
-- 多 Agent：把一个大主题拆成多个子主题并行研究
-- LangGraph Studio 可视化运行
+### 报错 `model should have at least 1 character`
 
+检查 `.env`，确认 `EMBEDDING_MODEL=qwen3-embedding:0.6b` 等号右边有值，不能是空行。
+
+### 报错缺少 `TAVILY_API_KEY`
+
+在 Tavily 官网注册并复制 Key，填进 `.env` 后重启程序。
+
+### 总结模型用 deepseek-r1 配合 JSON 模式报 500
+
+JSON 结构化输出建议使用 `qwen2.5:3b` 等普通对话模型；反思模型同理。
+
+## 参考
+
+- [langchain-ai/local-deep-researcher](https://github.com/langchain-ai/local-deep-researcher)：研究循环思路来源
+- [CrewAI memory/storage/rag_storage.py](https://github.com/crewAIInc/crewAI/blob/main/lib/crewai/src/crewai/memory/storage/rag_storage.py)：RAG 记忆层设计参考
+- [LangGraph](https://github.com/langchain-ai/langgraph)、[Chroma](https://github.com/chroma-core/chroma)
