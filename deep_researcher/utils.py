@@ -28,3 +28,13 @@ def is_valid_search_query(query: str) -> bool:
     if cjk_count > 15:
         return False
     return True
+
+def deduplicate_sources(source_lines: list) -> str:
+    """按整行去重，并拼成最终的参考来源文本。"""
+    seen = set()
+    unique = []
+    for line in source_lines:
+        if line.strip() and line not in seen:
+            seen.add(line)
+            unique.append(line)
+    return "\n".join(unique)

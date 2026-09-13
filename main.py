@@ -12,6 +12,11 @@ from deep_researcher.prompts import (
 from deep_researcher.schemas import UserIntent
 from langchain_core.messages import SystemMessage, HumanMessage
 from deep_researcher.memory import MemoryStore
+from deep_researcher.tool_registry import ToolError
+from deep_researcher.tool_specs import build_default_registry
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 
 def parse_intent(llm, user_message: str) -> UserIntent:
     """把用户的一句话解析成结构化动作。"""
@@ -99,8 +104,13 @@ def do_follow_up(graph, store, memory, branch, query_index, follow_up):
         print(f"找不到第 {query_index} 轮搜索的时间点。")
         return
     # 第 1 步：把那一轮的搜索词替换成追问内容（改的是该时间点的状态）
-    graph.update_state(snap.config, {"search_query": follow_up})
-
+    graph.update_state(
+        snap.config,
+        {
+            "search_query": follow_up,
+            "researcher_id": branch["researcher_id"],
+        },
+    )
     # 第 2 步：从修改后的时间点继续往后跑（web_research 会用新搜索词）
     result = graph.invoke(None, config=config)
     save_completed_branch(
@@ -116,14 +126,23 @@ def do_follow_up(graph, store, memory, branch, query_index, follow_up):
 
 def main():
     """程序入口：自然语言对话式研究。"""
-    with SqliteSaver.from_conn_string("research.sqlite") as checkpointer:
-        graph = DeepResearcher.build(checkpointer=checkpointer)
-        store = BranchStore("branches.sqlite")
+    with SqliteSaver.from_conn_string(
+            str(PROJECT_ROOT / "research.sqlite")
+    ) as checkpointer:
+        store = BranchStore(str(PROJECT_ROOT / "branches.sqlite"))
         memory = MemoryStore()
+        # 工具在 main 里组装，图只依赖 ToolRegistry
+        tool_registry = build_default_registry(memory)
+
+
+        graph = DeepResearcher.build(
+            checkpointer=checkpointer,
+            tool_registry=tool_registry,
+        )
         intent_llm = ChatOllama(model=INTENT_LLM, temperature=0, format="json")
 
         while True:
-            msg = input("\n你想做什么？（""\n我可以\n 进行新的研究\n 查看过往研究\n 对过往研究追问\n 退出研究）").strip()
+            msg = input("\n你想做什么？（""\n我可以\n 进行新的研究\n 查看过往研究\n 对过往研究追问\n  检索历史记忆\n 退出研究）").strip()
             if not msg:
                 continue
 
@@ -137,10 +156,23 @@ def main():
                 if not intent.topic:
                     print("请告诉我研究什么主题。")
                     continue
-                researcher_id = store.next_id()
-                thread_id = f"thread-{researcher_id}"
+                branch, created = store.get_or_create_by_topic(intent.topic)
+                researcher_id = branch["researcher_id"]
+                thread_id = branch["thread_id"]
+
+                if created:
+                    print(f"已创建新分支 {researcher_id}（主题：{intent.topic}）")
+                else:
+                    print(f"该主题已有分支 {researcher_id}，继续在该分支上研究")
                 config = {"configurable": {"thread_id": thread_id}}
-                result = graph.invoke({"research_topic": intent.topic}, config=config)
+                result = graph.invoke(
+                    {
+                        "research_topic": intent.topic,
+                        "researcher_id": researcher_id,
+                    },
+                    config=config,
+                )
+
                 save_completed_branch(
                     store,
                     memory,
@@ -156,13 +188,17 @@ def main():
                 print_branch(store.get(intent.researcher_id))
 
             elif intent.action == "recall":
-                # 直接用用户说的整句话做语义检索；指定了 r4 就只在 r4 的历史里找
-                hits = memory.recall(
-                    query=msg,
-                    researcher_id=intent.researcher_id,
-                    limit=5,
-                )
-                print_memory_hits(hits)
+                try:
+                    observation = tool_registry.call(
+                        "recall_memory",
+                        query=msg,
+                        researcher_id=intent.researcher_id,
+                        limit=1,
+                    )
+                except ToolError as exc:
+                    print(f"记忆检索失败：{exc}")
+                    continue
+                print_memory_hits(observation["hits"])
 
             elif intent.action == "follow_up":
                 branch = store.get(intent.researcher_id)
@@ -176,4 +212,4 @@ def main():
 
 
 if __name__ == "__main__":
-        main()
+            main()

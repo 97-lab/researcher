@@ -1,16 +1,39 @@
-from dataclasses import dataclass
 import operator
 from dataclasses import dataclass, field
+
 from typing_extensions import Annotated
 
 
 @dataclass
 class State:
-    research_topic:str
+    research_topic: str
+    researcher_id: str = ""
     search_query: str = ""
     search_results: str = ""
     summary: str = ""
-    research_loop_count: int = 0   #记录已经研究了几轮，循环靠它来判断什么时候停
-    sources_gathered: Annotated[list,operator.add]=field(default_factory=list)  #收集所有来源，最后写进报告
-    search_query_history: Annotated[list,operator.add]=field(default_factory=list)
-    searched_queries: Annotated[list,operator.add]=field(default_factory=list)  # 只记录真正搜过的搜索词
+
+    # 记录已经研究了几轮，循环靠它判断什么时候停
+    research_loop_count: int = 0
+
+    # 收集所有来源，最后写进报告
+    sources_gathered: Annotated[list, operator.add] = field(
+        default_factory=list
+    )
+    search_query_history: Annotated[list, operator.add] = field(
+        default_factory=list
+    )
+
+    # 只记录真正搜过的搜索词
+    searched_queries: Annotated[list, operator.add] = field(
+        default_factory=list
+    )
+
+    # 每一轮搜索的完整观察，供 HistoryProcessor 裁剪
+    search_observations: Annotated[list, operator.add] = field(
+        default_factory=list
+    )
+
+    # RAG 召回的历史记忆，供 ContextBuilder 注入提示词
+    memory_hits: Annotated[list, operator.add] = field(
+        default_factory=list
+    )

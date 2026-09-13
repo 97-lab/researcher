@@ -102,7 +102,7 @@ class MemoryStore:
         for doc, distance in docs:
             # 集合用的是余弦距离：距离 0 表示最相似
             # 转成相关度：1 - 距离 = 余弦相似度，越高越相关
-            score = 1.0 - distance
+            score = 1.0 - distance / 2.0
 
             if score < min_score:
                 continue

@@ -62,17 +62,6 @@ class WebResearchTools:
         threshold = max(1, int(len(topic_chars) * self.ratio))
         return overlap >= threshold
 
-    def deduplicate(self, source_lines: list) -> str:
-        """按行去重并拼成纯文本。"""
-        seen = set()
-        unique = []
-        for line in source_lines:
-            if line.strip() and line not in seen:
-                seen.add(line)
-                unique.append(line)
-        return "\n".join(unique)
-
-
 
 
 
