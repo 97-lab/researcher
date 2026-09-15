@@ -95,35 +95,59 @@ class ContextBuilder:
             text = text[: self.max_memory_chars] + "\n\n[历史记忆过长，已截断]"
         return text
 
+
+    def build_brief_text(self, state) -> str:
+        """把研究简报和子问题拼成一段文字。"""
+        brief = getattr(state, "research_brief", "") or "（暂无研究简报）"
+        sub_questions = getattr(state, "sub_questions", []) or []
+
+        if sub_questions:
+            question_lines = []
+            for index, question in enumerate(sub_questions, 1):
+                question_lines.append(f"{index}. {question}")
+            question_text = "\n".join(question_lines)
+        else:
+            question_text = "（暂无子问题）"
+
+        return (
+            f"<研究简报>\n{brief}\n</研究简报>\n\n"
+            f"<子问题>\n{question_text}\n</子问题>"
+        )
+
     def build_summary_human(self, state) -> str:
         """构建“总结节点”要发给模型的用户消息。"""
         observation_text = self.build_observation_text(
             state.search_observations
         )
         memory_text = self.build_memory_text(state.memory_hits)
-
+        brief_text = self.build_brief_text(state)
         if state.summary:
             return (
+                f"{brief_text}\n\n"
                 f"<已有总结>\n{state.summary}\n</已有总结>\n\n"
                 f"<相关历史记忆>\n{memory_text}\n</相关历史记忆>\n\n"
                 f"<近期搜索资料>\n{observation_text}\n</近期搜索资料>\n\n"
                 f"请把新资料整合进已有总结（主题：{state.research_topic}）。\n"
+                f"总结时要逐一覆盖上面的子问题。\n"
                 f"历史记忆只作为背景参考，不要把它当成新的参考来源。"
             )
-
         return (
+            f"{brief_text}\n\n"
             f"<相关历史记忆>\n{memory_text}\n</相关历史记忆>\n\n"
             f"<搜索资料>\n{observation_text}\n</搜索资料>\n\n"
             f"请根据资料创建总结（主题：{state.research_topic}）。\n"
+            f"总结时要逐一覆盖上面的子问题。\n"
             f"历史记忆只作为背景参考，不要把它当成新的参考来源。"
         )
 
     def build_query_human(self, state) -> str:
         """构建“生成搜索词节点”要发给模型的用户消息。"""
         memory_text = self.build_memory_text(state.memory_hits)
+        brief_text = self.build_brief_text(state)
+
         return (
-            f"请根据研究主题生成搜索词。\n\n"
-            f"研究主题：{state.research_topic}\n\n"
+            f"请根据研究简报生成搜索词。\n\n"
+            f"{brief_text}\n\n"
             f"<相关历史记忆>\n{memory_text}\n</相关历史记忆>\n\n"
             f"如果历史记忆已经覆盖了某个方向，请换一个新的搜索角度。"
         )
@@ -131,11 +155,14 @@ class ContextBuilder:
     def build_reflection_human(self, state) -> str:
         """构建“反思节点”要发给模型的用户消息。"""
         memory_text = self.build_memory_text(state.memory_hits)
+        brief_text = self.build_brief_text(state)
+
         return (
+            f"{brief_text}\n\n"
             f"当前总结如下：\n{state.summary}\n\n"
             f"已经搜索过的词：{state.search_query_history}\n"
             f"<相关历史记忆>\n{memory_text}\n</相关历史记忆>\n\n"
-            f"请分析知识盲区并生成追问搜索词。"
+            f"请检查哪些子问题还没有被充分回答，并生成追问搜索词。"
         )
 
 

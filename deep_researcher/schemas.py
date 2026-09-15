@@ -18,4 +18,11 @@ class UserIntent(BaseModel):
     follow_up: str = Field(default="", description="追问内容")
 
 
+class ResearchPlan(BaseModel):
+    brief: str = Field(description="一句话研究目标")
+    sub_questions: list[str] = Field(
+        default_factory=list,
+        description="需要回答的 2-4 个子问题",
+    )
+
     

@@ -8,7 +8,10 @@
 - **时间旅行**：回到某一轮搜索之前，换一个问题重新研究，产生新版本；
 - **RAG 版本记忆**：每个版本都会被向量化存档，覆盖后依然能用自然语言找回旧版本；
 - **工具运行时**：所有能力通过 ToolRegistry 统一注册、校验、调用；
-- **上下文构建**：用 HistoryProcessor 控制历史长度，避免 prompt 无限膨胀。
+- **上下文构建**：用 HistoryProcessor 控制历史长度，避免 prompt 无限膨胀；
+- **规划者 Agent**：研究开始前先生成研究简报和子问题；
+- **模型路由**：按角色选择快模型或质量模型，JSON 输出失败自动重试；
+- **轨迹与评测**：每次运行写入 `runs/*.jsonl`，评测脚本守护已有功能。
 
 ## 当前版本亮点
 
@@ -19,8 +22,12 @@
 - 自然语言控制：新研究 / 查看 / 追问 / 历史检索 / 退出
 - 工具注册表：`web_search` 与 `recall_memory` 统一管理
 - 上下文管理：只保留最近 N 轮搜索资料，单条过长自动截断
+- 模型路由：`fast` / `quality` 档位，角色级模型覆盖，JSON 自动重试
+- 规划者 Agent：先写研究简报和子问题，研究者按提纲执行
 - 主题与分支编号一一对应：同一主题复用编号，新主题分配新编号
 - 三套本地存储：精确时间线、当前分支、RAG 历史记忆
+- 轨迹记录：每次运行、每个节点、每次工具调用写入 `runs/*.jsonl`
+- 自动评测：`eval_research.py` 覆盖上下文、工具、轨迹、分支、记忆、模型路由
 
 ## 工作流程
 
@@ -46,6 +53,8 @@ new_research / view / follow_up / recall / exit
 
 ```
 START
+  ↓
+plan_research       规划者 Agent：先生成研究简报和子问题
   ↓
 recall_history      先从 RAG 里召回相关历史记忆
   ↓
@@ -110,13 +119,16 @@ route_research
 │   ├── configuration.py           # 从 .env 读取配置
 │   ├── context.py                 # ContextBuilder + HistoryProcessor
 │   ├── memory.py                  # RAG 记忆：remember / recall
+│   ├── model_router.py            # 按角色选模型、JSON 自动重试
 │   ├── tool_registry.py           # 工具注册表：登记、校验、调用
 │   ├── tool_specs.py              # web_search / recall_memory 注册
 │   ├── tools.py                   # Tavily 搜索与相关性过滤
+│   ├── trace.py                   # 运行轨迹：节点 / 工具 / 异常
 │   ├── prompts.py                 # 各节点提示词
 │   ├── schemas.py                 # 结构化输出模型
 │   └── utils.py                   # 搜索词校验、来源去重
 └── test_scripts/
+    ├── eval_research.py           # 自动回归评测
     ├── test_tool_registry.py      # 工具注册表测试
     ├── test_context.py            # 上下文裁剪测试
     ├── memory_test.py             # RAG 记忆独立测试
@@ -128,18 +140,31 @@ route_research
 ### 交互层：`main.py`
 
 - 读取用户输入；
-- 调 qwen2.5:3b 解析成 `UserIntent`；
+- 通过 `ModelRouter("intent")` 调模型解析成 `UserIntent`；
 - 根据动作路由到新研究、查看、追问、历史检索；
 - 组装 `MemoryStore` 与 `ToolRegistry`，交给图使用；
+- 每次研究/追问/召回创建 `TraceRecorder`；
 - 统一保存研究结果到 BranchStore 和 MemoryStore。
 
 ### 编排层：`deep_researcher/`
 
-- `graph.py`：LangGraph 节点与边；
+- `graph.py`：LangGraph 节点与边，包含规划者和研究者两个角色；
 - `state.py`：图状态，列表字段用 `Annotated[list, operator.add]` 累加；
 - `context.py`：历史裁剪与上下文拼装；
 - `configuration.py`：读取模型名、循环次数、上下文预算等配置；
 - `prompts.py`：搜索词、总结、反思、意图解析的提示词。
+
+### 模型层：`configuration.py` + `model_router.py`
+
+- `MODEL_PROFILE`：`fast` / `quality` 档位；
+- `MODEL_ROUTES`：`intent`、`planner`、`query`、`summarize`、`reflect` 的角色路由；
+- `ModelRouter.invoke_json()`：JSON 解析失败自动追问和重试；
+- 角色专用环境变量优先级最高。
+
+### 观测与评测层：`trace.py` + `eval_research.py`
+
+- `trace.py`：每次运行写 `runs/*.jsonl`，记录节点耗时、工具调用、异常；
+- `eval_research.py`：不需要 Ollama 和网络，快速验证核心行为是否退化。
 
 ### 工具层：`tool_registry.py` + `tool_specs.py` + `tools.py`
 
@@ -295,9 +320,14 @@ python main.py
 | `TAVILY_API_KEY` | 联网搜索密钥 | `tvly-xxxx` |
 | `OLLAMA_BASE_URL` | Ollama 服务地址 | `http://localhost:11434` |
 | `INTENT_LLM` | 意图解析模型 | `qwen2.5:3b` |
+| `PLANNER_LLM` | 规划者模型 | `qwen2.5:3b` |
 | `QUERY_LLM` | 搜索词生成模型 | `qwen2.5:3b` |
 | `SUMMARIZE_LLM` | 总结模型 | `qwen2.5:3b` |
 | `REFLECT_LLM` | 反思模型 | `qwen2.5:3b` |
+| `MODEL_PROFILE` | 模型档位：fast / quality | `fast` |
+| `FAST_LLM` | 快模型 | `qwen2.5:3b` |
+| `QUALITY_LLM` | 质量模型 | `qwen2.5:7b` |
+| `MODEL_MAX_RETRIES` | JSON 失败重试次数 | `2` |
 | `EMBEDDING_MODEL` | RAG 向量模型 | `qwen3-embedding:0.6b` |
 | `MAX_WEB_RESEARCH_LOOPS` | 单个分支最多研究轮数 | `3` |
 | `SEARCH_MAX_RESULTS` | 单次搜索最多取回条数 | `10` |
@@ -312,6 +342,7 @@ python main.py
 在项目根目录运行：
 
 ```powershell
+python -m test_scripts.eval_research
 python -m test_scripts.test_tool_registry
 python -m test_scripts.test_context
 python -m test_scripts.memory_test
@@ -319,11 +350,12 @@ python -m test_scripts.memory_test
 
 分别验证：
 
+- `eval_research`：上下文、工具、轨迹、分支映射、记忆相关度、模型路由、JSON 重试、规划者上下文；
 - 工具注册、权限、参数校验；
 - 上下文裁剪与历史记忆注入；
 - RAG 记忆的写入与召回。
 
-`memory_test` 需要 Ollama 正在运行并已拉取 `qwen3-embedding:0.6b`。
+`eval_research`、`test_tool_registry`、`test_context` 不需要网络和 Ollama；`memory_test` 需要 Ollama 正在运行并已拉取 `qwen3-embedding:0.6b`。
 
 ## 本地数据文件
 
@@ -377,8 +409,8 @@ JSON 结构化输出建议使用 `qwen2.5:3b` 等普通对话模型。
 
 ## 后续计划
 
-- Trace：把每次运行、每个节点、每次工具调用写入 `runs/*.jsonl`；
-- Eval：把上下文裁剪、工具校验、分支映射、记忆相关度换算做成自动回归测试。
+- 第三课 Trace + Eval 已完成：每次运行写入 `runs/*.jsonl`，`eval_research.py` 负责回归；
+- 当前不设固定后续路线图，按实际使用中暴露的问题迭代；
 
 ## 参考
 

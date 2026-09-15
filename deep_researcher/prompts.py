@@ -3,6 +3,21 @@ from datetime import datetime
 def get_current_date():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+planner_instructions = """你是研究规划者。请根据研究主题，先写一份简短的研究简报，再列出 2-4 个需要回答的子问题。
+
+研究主题：
+{research_topic}
+
+要求：
+1. brief 用一句话说明这次研究要解决什么；
+2. sub_questions 列出 2-4 个具体、可搜索的子问题；
+3. 只输出 JSON，不要解释。
+
+输出格式：
+{{"brief": "一句话研究目标", "sub_questions": ["子问题1", "子问题2"]}}
+"""
+
+
 query_writer_instructions = """你的目标是根据研究主题，生成一个适合搜索引擎的搜索词。
 
 <当前日期>

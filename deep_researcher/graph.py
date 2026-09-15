@@ -1,12 +1,9 @@
-import json
-
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_ollama import ChatOllama
 from langgraph.constants import END, START
 from langgraph.graph import StateGraph
-from pydantic import ValidationError
 
-from .configuration import MAX_LOOPS, QUERY_LLM, REFLECT_LLM, SUMMARIZE_LLM
+from .configuration import MAX_LOOPS
+from .model_router import ModelRouter
 from .context import (
     ContextBuilder,
     LastNObservations,
@@ -16,22 +13,28 @@ from .prompts import (
     get_current_date,
     json_mode_query_instructions,
     json_mode_reflection_instructions,
+    planner_instructions,
     query_writer_instructions,
     reflection_instructions,
-    summarizer_instructions,
-)
-from .schemas import FollowUpQuery, Query
+    summarizer_instructions,)
+
+
+from .schemas import FollowUpQuery, Query, ResearchPlan
 from .state import State
 from .tool_registry import ToolError
 from .tool_specs import build_default_registry
 from .utils import deduplicate_sources, is_valid_search_query
-
+from .tool_specs import build_default_registry
+from .trace import trace_node
+from .utils import deduplicate_sources, is_valid_search_query
 
 class DeepResearcher(StateGraph):
     """把整个研究流程封装成一个图类，节点都是类方法。"""
 
-    def __init__(self, tool_registry=None):
+    def __init__(self, tool_registry=None, model_router=None):
         super().__init__(State)
+        self.model_router = model_router or ModelRouter()
+
 
         # 工具注册表由外部注入；不传就只注册 web_search
         if tool_registry is None:
@@ -45,22 +48,9 @@ class DeepResearcher(StateGraph):
                 TruncateEachObservation(),
             ]
         )
-
-        self.summarize_llm = ChatOllama(
-            model=SUMMARIZE_LLM,
-            temperature=0,
-        )
-        self.query_llm_json = ChatOllama(
-            model=QUERY_LLM,
-            temperature=0,
-            format="json",
-        )
-        self.reflect_llm_json = ChatOllama(
-            model=REFLECT_LLM,
-            temperature=0,
-            format="json",
-        )
-
+        self.summarize_llm = self.model_router.get("summarize")
+        self.add_node("plan_research", self.plan_research)
+        self.add_node("recall_history", self.recall_history)
         self.add_node("recall_history", self.recall_history)
         self.add_node("generate_query", self.generate_query)
         self.add_node("web_research", self.web_research)
@@ -68,7 +58,8 @@ class DeepResearcher(StateGraph):
         self.add_node("reflect_on_summary", self.reflect_on_summary)
         self.add_node("finalize_summary", self.finalize_summary)
 
-        self.add_edge(START, "recall_history")
+        self.add_edge(START, "plan_research")
+        self.add_edge("plan_research", "recall_history")
         self.add_edge("recall_history", "generate_query")
         self.add_edge("generate_query", "web_research")
         self.add_edge("web_research", "summarize_sources")
@@ -84,34 +75,71 @@ class DeepResearcher(StateGraph):
         self.add_edge("finalize_summary", END)
 
     def generate_search_query_with_structured_output(
-        self,
-        llm,
-        system_prompt: str,
-        human_message: str,
-        model_class,
-        field_name: str,
-        fallback: str,
+            self,
+            role: str,
+            system_prompt: str,
+            human_message: str,
+            model_class,
+            field_name: str,
+            fallback: str,
     ) -> str:
-        """用 JSON 模式生成搜索词：解析 → Pydantic 校验 → 内容校验 → 兜底。"""
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=human_message),
-        ]
-        response = llm.invoke(messages)
+        """用 JSON 模式生成结构化内容：路由模型 → 解析校验 → 重试 → 兜底。"""
+        parsed, raw_text = self.model_router.invoke_json(
+            role=role,
+            system_prompt=system_prompt,
+            human_prompt=human_message,
+            model_class=model_class,
+        )
 
-        query = ""
-        try:
-            data = json.loads(response.content)
-            parsed = model_class.model_validate(data)
-            query = getattr(parsed, field_name, "").strip()
-        except (json.JSONDecodeError, ValidationError, AttributeError):
-            query = ""
+        if parsed is None:
+            return fallback
 
-        if not is_valid_search_query(query):
-            query = fallback
+        value = getattr(parsed, field_name, "").strip()
 
-        return query
+        if not is_valid_search_query(value):
+            return fallback
 
+        return value
+    @trace_node("plan_research")
+    def plan_research(self, state):
+        """规划者 Agent：先生成研究简报和子问题。"""
+        system_prompt = planner_instructions.format(
+            research_topic=state.research_topic
+        )
+        human_prompt = (
+            f"研究主题：{state.research_topic}\n"
+            f"请生成研究简报和子问题。"
+        )
+
+        parsed, raw_text = self.model_router.invoke_json(
+            role="planner",
+            system_prompt=system_prompt,
+            human_prompt=human_prompt,
+            model_class=ResearchPlan,
+        )
+
+        if parsed is None:
+            print("[plan_research] 规划失败，使用主题作为简报")
+            return {
+                "research_brief": f"研究主题：{state.research_topic}",
+                "sub_questions": [],
+            }
+
+        brief = parsed.brief.strip() or state.research_topic
+        sub_questions = []
+        for question in parsed.sub_questions:
+            cleaned = question.strip()
+            if cleaned:
+                sub_questions.append(cleaned)
+
+        print(f"[plan_research] 规划完成，共 {len(sub_questions)} 个子问题")
+        return {
+            "research_brief": brief,
+            "sub_questions": sub_questions,
+        }
+
+
+    @trace_node("recall_history")
     def recall_history(self, state):
         """研究开始前，先从 RAG 里召回相关历史记忆。"""
         try:
@@ -133,6 +161,7 @@ class DeepResearcher(StateGraph):
         print(f"[recall_history] 命中 {len(memory_lines)} 条历史记忆")
         return {"memory_hits": memory_lines}
 
+    @trace_node("generate_query")
     def generate_query(self, state):
         formatted_prompt = (
             query_writer_instructions.format(
@@ -145,7 +174,7 @@ class DeepResearcher(StateGraph):
         human_message = self.context_builder.build_query_human(state)
 
         query = self.generate_search_query_with_structured_output(
-            llm=self.query_llm_json,
+            role="query",
             system_prompt=formatted_prompt,
             human_message=human_message,
             model_class=Query,
@@ -153,11 +182,13 @@ class DeepResearcher(StateGraph):
             fallback=f"Tell me more about {state.research_topic}",
         )
 
+
         return {
             "search_query": query,
             "search_query_history": [query],
         }
 
+    @trace_node("web_research")
     def web_research(self, state):
         try:
             observation = self.tool_registry.call(
@@ -183,6 +214,8 @@ class DeepResearcher(StateGraph):
             "research_loop_count": state.research_loop_count + 1,
         }
 
+
+    @trace_node("summarize_sources")
     def summarize_sources(self, state):
         human = self.context_builder.build_summary_human(state)
 
@@ -202,7 +235,7 @@ class DeepResearcher(StateGraph):
         print("\n", flush=True)
 
         return {"summary": "".join(pieces)}
-
+    @trace_node("reflect_on_summary")
     def reflect_on_summary(self, state):
         formatted_prompt = (
             reflection_instructions.format(
@@ -214,7 +247,7 @@ class DeepResearcher(StateGraph):
         human_message = self.context_builder.build_reflection_human(state)
 
         new_query = self.generate_search_query_with_structured_output(
-            llm=self.reflect_llm_json,
+            role="reflect",
             system_prompt=formatted_prompt,
             human_message=human_message,
             model_class=FollowUpQuery,
@@ -246,8 +279,9 @@ class DeepResearcher(StateGraph):
         return {"summary": final}
 
     @classmethod
-    def build(cls, checkpointer=None, tool_registry=None):
+    def build(cls, checkpointer=None, tool_registry=None, model_router=None):
         """组装并编译图，外部统一从这里拿实例。"""
-        return cls(tool_registry=tool_registry).compile(
-            checkpointer=checkpointer
-        )
+        return cls(
+            tool_registry=tool_registry,
+            model_router=model_router,
+        ).compile(checkpointer=checkpointer)

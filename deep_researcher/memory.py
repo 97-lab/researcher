@@ -11,6 +11,17 @@ from .configuration import OLLAMA_BASE_URL
 
 
 DEFAULT_MIN_SCORE = 0.3
+
+def distance_to_score(distance: float) -> float:
+    """把 Chroma 的距离换算成余弦相似度。
+
+    当前集合：space = l2，返回的是平方 L2 距离；
+    qwen3-embedding 向量已归一化，因此：
+    cosine = 1 - distance / 2
+    """
+    return 1.0 - distance / 2.0
+
+
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 DEFAULT_DB_DIR = str(Path(__file__).resolve().parents[1] / "memory_store")
 
@@ -102,8 +113,7 @@ class MemoryStore:
         for doc, distance in docs:
             # 集合用的是余弦距离：距离 0 表示最相似
             # 转成相关度：1 - 距离 = 余弦相似度，越高越相关
-            score = 1.0 - distance / 2.0
-
+            score = distance_to_score(distance)
             if score < min_score:
                 continue
 

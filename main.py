@@ -15,22 +15,24 @@ from deep_researcher.memory import MemoryStore
 from deep_researcher.tool_registry import ToolError
 from deep_researcher.tool_specs import build_default_registry
 from pathlib import Path
+from deep_researcher.trace import TraceRecorder, use_recorder
+from deep_researcher.model_router import ModelRouter
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def parse_intent(llm, user_message: str) -> UserIntent:
-    """把用户的一句话解析成结构化动作。"""
-    messages = [
-        SystemMessage(content=intent_parser_instructions + json_mode_intent_instructions),
-        HumanMessage(content=user_message),
-    ]
-    response = llm.invoke(messages)
-    try:
-        data = json.loads(response.content)
-        return UserIntent.model_validate(data)
-    except (json.JSONDecodeError, ValidationError):
+def parse_intent(model_router, user_message: str) -> UserIntent:
+    """把用户的一句话解析成结构化动作，并自动重试 JSON。"""
+    parsed, raw_text = model_router.invoke_json(
+        role="intent",
+        system_prompt=(
+            intent_parser_instructions + json_mode_intent_instructions
+        ),
+        human_prompt=user_message,
+        model_class=UserIntent,
+    )
+    if parsed is None:
         return UserIntent(action="unknown")
-
+    return parsed
 
 def print_branch(branch):
     """打印一个分支的搜索词和完整总结（含参考来源）。"""
@@ -58,6 +60,30 @@ def print_memory_hits(hits):
         )
         print(hit["content"])
         print()
+
+
+def run_with_trace(label, action, payload, func):
+    """执行一段逻辑，并把过程写入 runs/*.jsonl。"""
+    recorder = TraceRecorder.create(
+        PROJECT_ROOT / "runs",
+        label=label,
+    )
+    recorder.record("run_input", action=action, **payload)
+
+    try:
+        with use_recorder(recorder):
+            result = func()
+    except Exception as exc:
+        recorder.finish(
+            status="error",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        print(recorder.summary_text())
+        raise
+
+    recorder.finish(status="ok")
+    print(recorder.summary_text())
+    return result
 
 def save_completed_branch(store, memory, researcher_id, thread_id, topic, result):
     """研究结束后同时更新两类存储：
@@ -104,15 +130,26 @@ def do_follow_up(graph, store, memory, branch, query_index, follow_up):
         print(f"找不到第 {query_index} 轮搜索的时间点。")
         return
     # 第 1 步：把那一轮的搜索词替换成追问内容（改的是该时间点的状态）
-    graph.update_state(
-        snap.config,
-        {
-            "search_query": follow_up,
+    def follow_up_job():
+        graph.update_state(
+            snap.config,
+            {
+                "search_query": follow_up,
+                "researcher_id": branch["researcher_id"],
+            },
+        )
+        return graph.invoke(None, config=config)
+
+    result = run_with_trace(
+        label=f"follow-{branch['researcher_id']}",
+        action="follow_up",
+        payload={
             "researcher_id": branch["researcher_id"],
+            "query_index": query_index,
+            "follow_up": follow_up,
         },
+        func=follow_up_job,
     )
-    # 第 2 步：从修改后的时间点继续往后跑（web_research 会用新搜索词）
-    result = graph.invoke(None, config=config)
     save_completed_branch(
         store,
         memory,
@@ -131,22 +168,23 @@ def main():
     ) as checkpointer:
         store = BranchStore(str(PROJECT_ROOT / "branches.sqlite"))
         memory = MemoryStore()
-        # 工具在 main 里组装，图只依赖 ToolRegistry
-        tool_registry = build_default_registry(memory)
 
+        model_router = ModelRouter()
+        print("模型路由:", model_router.routes)
+
+        tool_registry = build_default_registry(memory)
 
         graph = DeepResearcher.build(
             checkpointer=checkpointer,
             tool_registry=tool_registry,
+            model_router=model_router,
         )
-        intent_llm = ChatOllama(model=INTENT_LLM, temperature=0, format="json")
-
         while True:
             msg = input("\n你想做什么？（""\n我可以\n 进行新的研究\n 查看过往研究\n 对过往研究追问\n  检索历史记忆\n 退出研究）").strip()
             if not msg:
                 continue
 
-            intent = parse_intent(intent_llm, msg)
+            intent = parse_intent(model_router, msg)
             print("解析结果:", intent.model_dump())
 
             if intent.action == "exit":
@@ -165,14 +203,22 @@ def main():
                 else:
                     print(f"该主题已有分支 {researcher_id}，继续在该分支上研究")
                 config = {"configurable": {"thread_id": thread_id}}
-                result = graph.invoke(
-                    {
-                        "research_topic": intent.topic,
+                result = run_with_trace(
+                    label=f"new-{researcher_id}",
+                    action="new_research",
+                    payload={
+                        "topic": intent.topic,
                         "researcher_id": researcher_id,
+                        "reused": not created,
                     },
-                    config=config,
+                    func=lambda: graph.invoke(
+                        {
+                            "research_topic": intent.topic,
+                            "researcher_id": researcher_id,
+                        },
+                        config=config,
+                    ),
                 )
-
                 save_completed_branch(
                     store,
                     memory,
@@ -183,17 +229,24 @@ def main():
                 )
                 print(f"已创建分支记忆 {researcher_id}")
                 print_branch(store.get(researcher_id))
-
             elif intent.action == "view":
                 print_branch(store.get(intent.researcher_id))
 
             elif intent.action == "recall":
                 try:
-                    observation = tool_registry.call(
-                        "recall_memory",
-                        query=msg,
-                        researcher_id=intent.researcher_id,
-                        limit=1,
+                    observation = run_with_trace(
+                        label=f"recall-{intent.researcher_id or 'all'}",
+                        action="recall",
+                        payload={
+                            "query": msg,
+                            "researcher_id": intent.researcher_id,
+                        },
+                        func=lambda: tool_registry.call(
+                            "recall_memory",
+                            query=msg,
+                            researcher_id=intent.researcher_id,
+                            limit=1,
+                        ),
                     )
                 except ToolError as exc:
                     print(f"记忆检索失败：{exc}")
