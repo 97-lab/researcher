@@ -8,11 +8,20 @@ from typing_extensions import Annotated
 class State:
     research_topic: str
     researcher_id: str = ""
+    thread_id: str = ""
     search_query: str = ""
     search_results: str = ""
     summary: str = ""
     research_brief: str = ""  # 规划者生成的研究简报与子问题
     sub_questions: list = field(default_factory=list)  # 规划者生成的研究简报与子问题
+
+
+    # 审核者 Agent 的状态
+    review_round: int = 0
+    review_passed: bool = False
+    review_feedback: str = ""
+    uncovered_questions: list = field(default_factory=list)
+
 
     # 记录已经研究了几轮，循环靠它判断什么时候停
     research_loop_count: int = 0

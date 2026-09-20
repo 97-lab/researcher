@@ -17,7 +17,7 @@ from deep_researcher.context import (
     TruncateEachObservation,
 )
 from deep_researcher.memory import distance_to_score
-from deep_researcher.schemas import ResearchPlan
+from deep_researcher.schemas import ResearchPlan, ReviewResult, UserIntent
 from deep_researcher.state import State
 from deep_researcher.tool_registry import (
     ToolError,
@@ -174,6 +174,37 @@ def check_planner_context():
 
     assert "研究简报" in text
     assert "北极圈升温速度有多快" in text
+    assert "海冰减少有什么后果" in text
+
+def check_reviewer_context():
+    review = ReviewResult.model_validate(
+        {
+            "passed": False,
+            "feedback": "海冰减少的后果还没有明确结论。",
+            "uncovered_questions": ["海冰减少有什么后果？"],
+            "next_query": "北极圈 海冰 减少 后果",
+        }
+    )
+
+    assert review.passed is False
+    assert len(review.uncovered_questions) == 1
+
+    state = State(
+        research_topic="北极圈的气候影响",
+        research_brief="搞清楚北极圈气候变化的成因和影响",
+        sub_questions=[
+            "北极圈升温速度有多快？",
+            "海冰减少有什么后果？",
+        ],
+        summary="目前只说明了升温速度，还没有展开海冰后果。",
+        search_query_history=["北极圈 气候变化 影响"],
+    )
+
+    builder = ContextBuilder()
+    text = builder.build_review_human(state)
+
+    assert "研究简报" in text
+    assert "当前总结" in text
     assert "海冰减少有什么后果" in text
 
 

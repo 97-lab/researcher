@@ -22,6 +22,32 @@ def distance_to_score(distance: float) -> float:
     return 1.0 - distance / 2.0
 
 
+def build_recall_filter(
+    researcher_id: str = "",
+    thread_id: str = "",
+    kind: str = "",
+):
+    """把分支过滤条件转成 Chroma 的 where 结构。"""
+    conditions = []
+
+    if researcher_id:
+        conditions.append({"researcher_id": researcher_id})
+
+    if thread_id:
+        conditions.append({"thread_id": thread_id})
+
+    if kind:
+        conditions.append({"kind": kind})
+
+    if not conditions:
+        return None
+
+    if len(conditions) == 1:
+        return conditions[0]
+
+    return {"$and": conditions}
+
+
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 DEFAULT_DB_DIR = str(Path(__file__).resolve().parents[1] / "memory_store")
 
@@ -62,7 +88,6 @@ class MemoryStore:
         summary = version.get("summary", "")
 
         if not researcher_id or not summary:
-            print("[MemoryStore] 版本缺少 researcher_id 或 summary，已跳过。")
             return ""
 
         memory_id = f"{researcher_id}-{uuid.uuid4().hex[:12]}"
@@ -72,6 +97,7 @@ class MemoryStore:
             "researcher_id": researcher_id,
             "thread_id": version.get("thread_id", ""),
             "topic": version.get("topic", ""),
+            "kind": version.get("kind", "research_version"),
             # queries 是列表，Chroma 的 metadata 只接受标量，所以先转 JSON 字符串
             "queries": json.dumps(version.get("queries", []), ensure_ascii=False),
             "remembered_at": datetime.now().isoformat(timespec="seconds"),
@@ -83,10 +109,17 @@ class MemoryStore:
             ids=[memory_id],
         )
 
-        print(f"[MemoryStore] 已存档 {researcher_id} 的版本 -> {memory_id}")
         return memory_id
 
-    def recall(self, query, researcher_id="", limit=5, min_score=DEFAULT_MIN_SCORE):
+    def recall(
+        self,
+        query,
+        researcher_id="",
+        thread_id="",
+        kind="",
+        limit=5,
+        min_score=DEFAULT_MIN_SCORE,
+    ):
         """用一句自然语言找回最相关的历史版本。
 
         只返回相关度 >= min_score 的记忆，避免把无关旧记忆一起打印。
@@ -94,9 +127,11 @@ class MemoryStore:
         if not query.strip():
             return []
 
-        where = None
-        if researcher_id:
-            where = {"researcher_id": researcher_id}
+        where = build_recall_filter(
+            researcher_id=researcher_id,
+            thread_id=thread_id,
+            kind=kind,
+        )
 
         try:
             # similarity_search_with_score 返回的是“距离”，越小越相似
@@ -105,8 +140,7 @@ class MemoryStore:
                 k=limit,
                 filter=where,
             )
-        except Exception as exc:
-            print(f"[MemoryStore] 检索失败：{exc}")
+        except Exception:
             return []
 
         results = []

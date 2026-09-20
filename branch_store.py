@@ -129,6 +129,41 @@ class BranchStore:
         ).fetchone()
         return self._row_to_branch(row)
 
+    def list_branches(self):
+        """列出所有分支，最近的排前面。"""
+        rows = self.conn.execute(
+            """
+            SELECT researcher_id, thread_id, topic, queries, summary
+            FROM branches
+            ORDER BY updated_at DESC
+            """
+        ).fetchall()
+
+        branches = []
+        for row in rows:
+            branches.append(self._row_to_branch(row))
+        return branches
+
+    def find_branch_for_message(self, message):
+        """在用户的话里找“已经研究过的主题”，取最长匹配。"""
+        normalized_message = self.normalize_topic(message)
+        best_branch = None
+        best_length = 0
+
+        for branch in self.list_branches():
+            topic_key = self.normalize_topic(branch["topic"])
+            if not topic_key:
+                continue
+
+            if (
+                topic_key in normalized_message
+                and len(topic_key) > best_length
+            ):
+                best_branch = branch
+                best_length = len(topic_key)
+
+        return best_branch
+
     def _next_number(self):
         """从持久化计数器分配下一个编号，不依赖当前行数。"""
         row = self.conn.execute(

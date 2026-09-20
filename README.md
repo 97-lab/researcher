@@ -11,43 +11,64 @@
 - **上下文构建**：用 HistoryProcessor 控制历史长度，避免 prompt 无限膨胀；
 - **规划者 Agent**：研究开始前先生成研究简报和子问题；
 - **模型路由**：按角色选择快模型或质量模型，JSON 输出失败自动重试；
-- **轨迹与评测**：每次运行写入 `runs/*.jsonl`，评测脚本守护已有功能。
+- **轨迹与评测**：每次运行写入 `runs/*.jsonl`，评测脚本守护已有功能；
+- **对话理解**：结合最近几轮对话补全代词、省略和主题延续；
+- **歧义澄清**：指代不明时先反问，用户回答后再继续原任务。
 
 ## 当前版本亮点
 
 - 全程本地对话模型（Ollama），不依赖云端 LLM
 - LangGraph 反思循环：搜索 → 总结 → 反思 → 继续搜索或收尾
 - Tavily 联网搜索 + 相关性过滤 + 来源去重
-- 总结支持流式输出，逐字显示
-- 自然语言控制：新研究 / 查看 / 追问 / 历史检索 / 退出
+- 研究完成后输出最终总结和参考来源
+- 自然语言控制：新研究 / 继续研究 / 查看 / 追问 / 历史检索 / 退出
 - 工具注册表：`web_search` 与 `recall_memory` 统一管理
 - 上下文管理：只保留最近 N 轮搜索资料，单条过长自动截断
 - 模型路由：`fast` / `quality` 档位，角色级模型覆盖，JSON 自动重试
 - 规划者 Agent：先写研究简报和子问题，研究者按提纲执行
+- 对话记忆：保存最近几轮对话、当前活跃主题和待澄清问题
+- 歧义反问：指代不明时暂停任务，等用户输入澄清答案
 - 主题与分支编号一一对应：同一主题复用编号，新主题分配新编号
-- 三套本地存储：精确时间线、当前分支、RAG 历史记忆
+- 四套本地存储：精确时间线、当前分支、RAG 历史记忆、会话记忆
 - 轨迹记录：每次运行、每个节点、每次工具调用写入 `runs/*.jsonl`
 - 自动评测：`eval_research.py` 覆盖上下文、工具、轨迹、分支、记忆、模型路由
+- 终端降噪：研究过程只显示“思考中...”，最终只输出总结和参考来源
 
 ## 工作流程
 
-### 1. 用户输入与意图路由
+### 1. 对话理解与意图路由
 
 ```
 用户自然语言
    ↓
-parse_intent（qwen2.5:3b）
+读取会话上下文（活跃主题、最近几轮、分支列表）
    ↓
-new_research / view / follow_up / recall / exit
+understand_message（代词消解、省略补全、主题延续）
+   ↓
+new_research / continue_research / answer_from_memory
+view / follow_up / recall / exit
 ```
 
 | 动作 | 含义 | 走哪条路 |
 |---|---|---|
 | `new_research` | 研究新主题 | 创建或复用主题分支，运行完整研究图 |
+| `continue_research` | 同一主题继续追问 | 自动匹配分支，追加一轮研究 |
+| `answer_from_memory` | 历史总结足够回答 | 直接从 RAG 记忆生成回答 |
 | `view` | 查看当前版本 | 读 BranchStore |
 | `follow_up` | 回到某轮重新研究 | 用 checkpoint 做时间旅行 |
 | `recall` | 找回被覆盖的旧版本 | 调 RAG 记忆工具 |
 | `exit` | 退出 | 结束程序 |
+
+如果代词或主题不明确，会先进入澄清流程：
+
+```
+用户：他得过哪些奖项？
+Agent：你指的是哪位？
+       1. 沈石溪
+       2. 曹文轩
+用户：沈石溪
+Agent：按“沈石溪获得过哪些奖项”继续。
+```
 
 ### 2. 一次新研究的图流程
 
@@ -118,6 +139,7 @@ route_research
 │   ├── state.py                   # 图状态定义
 │   ├── configuration.py           # 从 .env 读取配置
 │   ├── context.py                 # ContextBuilder + HistoryProcessor
+│   ├── conversation.py            # 会话记忆、代词消解、歧义澄清
 │   ├── memory.py                  # RAG 记忆：remember / recall
 │   ├── model_router.py            # 按角色选模型、JSON 自动重试
 │   ├── tool_registry.py           # 工具注册表：登记、校验、调用
@@ -146,6 +168,13 @@ route_research
 - 每次研究/追问/召回创建 `TraceRecorder`；
 - 统一保存研究结果到 BranchStore 和 MemoryStore。
 
+### 会话层：`deep_researcher/conversation.py`
+
+- 保存最近几轮对话、活跃主题、活跃分支和待澄清问题；
+- `understand_message()`：结合上下文做代词消解和省略补全；
+- `resolve_clarification()`：解析用户对反问的回答；
+- `answer_from_memory()`：优先用历史记忆回答，不够再继续研究。
+
 ### 编排层：`deep_researcher/`
 
 - `graph.py`：LangGraph 节点与边，包含规划者和研究者两个角色；
@@ -157,7 +186,7 @@ route_research
 ### 模型层：`configuration.py` + `model_router.py`
 
 - `MODEL_PROFILE`：`fast` / `quality` 档位；
-- `MODEL_ROUTES`：`intent`、`planner`、`query`、`summarize`、`reflect` 的角色路由；
+- `MODEL_ROUTES`：`conversation`、`intent`、`planner`、`reviewer`、`query`、`summarize`、`reflect` 的角色路由；
 - `ModelRouter.invoke_json()`：JSON 解析失败自动追问和重试；
 - 角色专用环境变量优先级最高。
 
@@ -188,6 +217,7 @@ route_research
 | LangGraph Checkpoint | `research.sqlite` | 每个状态的完整时间线 | 支持时间旅行 |
 | BranchStore | `branches.sqlite` | 主题与当前版本 | 主题查重、编号持久化 |
 | MemoryStore | `memory_store/` | 所有历史版本的向量 | 追加式、语义召回 |
+| ConversationStore | `conversation.sqlite` | 最近对话、活跃主题、待澄清问题 | 支持聊天式上下文 |
 
 三者分工：
 
@@ -227,6 +257,7 @@ CONTEXT_MAX_MEMORY_CHARS=2000
 - `researcher_id`
 - `thread_id`
 - `topic`
+- `kind`
 - `queries`
 - `remembered_at`
 
@@ -241,6 +272,7 @@ CONTEXT_MAX_MEMORY_CHARS=2000
 ```
 
 - 默认门槛：`min_score = 0.3`。
+- `thread_id` 用于精确到具体分支，避免不同主题的旧记忆混在一起。
 
 ## 环境要求
 
@@ -307,11 +339,23 @@ python main.py
 | 全局找回旧版本 | 我之前研究过亚里士多德吗？当时怎么总结的？ |
 | 退出 | 退出 |
 
-程序会先打印解析结果：
+连续追问示例：
 
 ```text
-解析结果: {'action': 'recall', 'researcher_id': 'r1', ...}
+用户：对沈石溪进行介绍
+Agent：思考中...
+Agent：（最终总结和参考来源）
+
+用户：他得过哪些奖项？
+Agent：思考中...
+Agent：（按“沈石溪获得过哪些奖项”继续研究或直接回答）
 ```
+
+终端输出规则：
+
+- 研究过程中只显示 `Agent：思考中...`
+- 最终只显示最终总结和参考来源
+- 不显示模型路由、意图 JSON、节点日志、相关度和分支元数据
 
 ## 常用配置
 
@@ -319,8 +363,10 @@ python main.py
 |---|---|---|
 | `TAVILY_API_KEY` | 联网搜索密钥 | `tvly-xxxx` |
 | `OLLAMA_BASE_URL` | Ollama 服务地址 | `http://localhost:11434` |
+| `CONVERSATION_LLM` | 对话理解/代词消解模型 | `qwen2.5:3b` |
 | `INTENT_LLM` | 意图解析模型 | `qwen2.5:3b` |
 | `PLANNER_LLM` | 规划者模型 | `qwen2.5:3b` |
+| `REVIEWER_LLM` | 审核者模型 | `qwen2.5:3b` |
 | `QUERY_LLM` | 搜索词生成模型 | `qwen2.5:3b` |
 | `SUMMARIZE_LLM` | 总结模型 | `qwen2.5:3b` |
 | `REFLECT_LLM` | 反思模型 | `qwen2.5:3b` |
@@ -328,6 +374,7 @@ python main.py
 | `FAST_LLM` | 快模型 | `qwen2.5:3b` |
 | `QUALITY_LLM` | 质量模型 | `qwen2.5:7b` |
 | `MODEL_MAX_RETRIES` | JSON 失败重试次数 | `2` |
+| `MAX_REVIEW_ROUNDS` | 审核者最多允许补搜轮数 | `1` |
 | `EMBEDDING_MODEL` | RAG 向量模型 | `qwen3-embedding:0.6b` |
 | `MAX_WEB_RESEARCH_LOOPS` | 单个分支最多研究轮数 | `3` |
 | `SEARCH_MAX_RESULTS` | 单次搜索最多取回条数 | `10` |
@@ -350,10 +397,12 @@ python -m test_scripts.memory_test
 
 分别验证：
 
-- `eval_research`：上下文、工具、轨迹、分支映射、记忆相关度、模型路由、JSON 重试、规划者上下文；
+- `eval_research`：当前 8 项离线评测，覆盖上下文、工具、轨迹、分支映射、记忆相关度、规划者上下文、模型路由和 JSON 重试；
 - 工具注册、权限、参数校验；
 - 上下文裁剪与历史记忆注入；
 - RAG 记忆的写入与召回。
+
+连续对话、代词消解和歧义澄清目前作为下一步评测扩展项。
 
 `eval_research`、`test_tool_registry`、`test_context` 不需要网络和 Ollama；`memory_test` 需要 Ollama 正在运行并已拉取 `qwen3-embedding:0.6b`。
 
@@ -364,6 +413,7 @@ python -m test_scripts.memory_test
 | `research.sqlite` | LangGraph 检查点，支撑时间旅行 | 否 |
 | `branches.sqlite` | 主题分支映射与当前版本 | 否 |
 | `memory_store/` | Chroma 向量库，保存历史版本 | 否 |
+| `conversation.sqlite` | 最近对话和会话状态 | 否 |
 | `.env` | 私密配置 | 否 |
 
 这些文件已经加入 `.gitignore`。
@@ -407,10 +457,12 @@ JSON 结构化输出建议使用 `qwen2.5:3b` 等普通对话模型。
 - 编号计数器持久化；
 - `main.py` 的数据库路径固定到项目根目录。
 
-## 后续计划
+## 当前阶段说明
 
-- 第三课 Trace + Eval 已完成：每次运行写入 `runs/*.jsonl`，`eval_research.py` 负责回归；
-- 当前不设固定后续路线图，按实际使用中暴露的问题迭代；
+- Trace + Eval 已完成：每次运行写入 `runs/*.jsonl`，`eval_research.py` 负责回归；
+- 对话理解、代词消解和歧义澄清已完成代码接入；
+- FastAPI 后端接口已经完成设计（`/chat`、`/chat/stream`、`/branches` 等），但代码尚未加入项目；
+- 下一步建议先补连续对话评测，再考虑把 FastAPI 后端落地。
 
 ## 参考
 

@@ -1,27 +1,39 @@
-import json
-from langchain_ollama import ChatOllama
+from pathlib import Path
+
 from langgraph.checkpoint.sqlite import SqliteSaver
-from pydantic import ValidationError
+
 from branch_store import BranchStore
-from deep_researcher.configuration import INTENT_LLM
+from deep_researcher.conversation import (
+    ConversationStore,
+    answer_from_memory,
+    resolve_clarification,
+    understand_message,
+)
 from deep_researcher.graph import DeepResearcher
+from deep_researcher.memory import MemoryStore
+from deep_researcher.model_router import ModelRouter
 from deep_researcher.prompts import (
     intent_parser_instructions,
     json_mode_intent_instructions,
 )
 from deep_researcher.schemas import UserIntent
-from langchain_core.messages import SystemMessage, HumanMessage
-from deep_researcher.memory import MemoryStore
 from deep_researcher.tool_registry import ToolError
 from deep_researcher.tool_specs import build_default_registry
-from pathlib import Path
 from deep_researcher.trace import TraceRecorder, use_recorder
-from deep_researcher.model_router import ModelRouter
+from deep_researcher.utils import deduplicate_sources
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent
+INPUT_PROMPT = "\n用户："
+AGENT_PREFIX = "Agent："
 
 
-def parse_intent(model_router, user_message: str) -> UserIntent:
-    """把用户的一句话解析成结构化动作，并自动重试 JSON。"""
+def print_agent(text):
+    print(f"{AGENT_PREFIX}{text}", flush=True)
+
+
+def parse_intent_fallback(model_router, user_message):
+    """对话理解失败时的兜底解析。"""
     parsed, raw_text = model_router.invoke_json(
         role="intent",
         system_prompt=(
@@ -34,36 +46,26 @@ def parse_intent(model_router, user_message: str) -> UserIntent:
         return UserIntent(action="unknown")
     return parsed
 
-def print_branch(branch):
-    """打印一个分支的搜索词和完整总结（含参考来源）。"""
-    if not branch:
-        print("找不到该分支。")
-        return
-    print(f"分支: {branch['researcher_id']} | 主题: {branch['topic']}")
-    for i, q in enumerate(branch["queries"], 1):
-        print(f"  第 {i} 轮搜索词: {q}")
-    print("==== 总结（含参考来源）====")
-    print(branch["summary"])
 
-def print_memory_hits(hits):
-    """打印 RAG 召回的历史版本。"""
-    if not hits:
-        print("没有找到相关的历史记忆。")
-        return
+def resolve_branch(store, active_researcher_id, user_message, explicit_id=""):
+    """按优先级找分支：显式编号 → 消息主题匹配 → 当前活跃分支。"""
+    if explicit_id:
+        branch = store.get(explicit_id)
+        if branch:
+            return branch
 
-    print(f"找到 {len(hits)} 条相关历史记忆：")
-    for i, hit in enumerate(hits, 1):
-        meta = hit["metadata"]
-        print(
-            f"--- 第 {i} 名 | 相关度: {hit['score']} "
-            f"| 分支: {meta.get('researcher_id', '')}"
-        )
-        print(hit["content"])
-        print()
+    branch = store.find_branch_for_message(user_message)
+    if branch:
+        return branch
+
+    if active_researcher_id:
+        return store.get(active_researcher_id)
+
+    return None
 
 
 def run_with_trace(label, action, payload, func):
-    """执行一段逻辑，并把过程写入 runs/*.jsonl。"""
+    """执行一段逻辑并写入轨迹；终端不输出调试信息。"""
     recorder = TraceRecorder.create(
         PROJECT_ROOT / "runs",
         label=label,
@@ -78,24 +80,18 @@ def run_with_trace(label, action, payload, func):
             status="error",
             error=f"{type(exc).__name__}: {exc}",
         )
-        print(recorder.summary_text())
         raise
 
     recorder.finish(status="ok")
-    print(recorder.summary_text())
     return result
 
-def save_completed_branch(store, memory, researcher_id, thread_id, topic, result):
-    """研究结束后同时更新两类存储：
 
-    BranchStore：只保留当前版本（覆盖旧版本）
-    MemoryStore：追加这个版本到 RAG 记忆（历史版本不会丢）
-    """
+def save_completed_branch(store, memory, researcher_id, thread_id, topic, result):
+    """研究结束后双写 BranchStore 和 MemoryStore。"""
     queries = result.get("searched_queries", [])
     summary = result["summary"]
 
     store.save(researcher_id, thread_id, topic, queries, summary)
-
     memory.remember(
         {
             "researcher_id": researcher_id,
@@ -103,14 +99,18 @@ def save_completed_branch(store, memory, researcher_id, thread_id, topic, result
             "topic": topic,
             "queries": queries,
             "summary": summary,
+            "kind": "research_version",
         }
     )
+
 
 def find_round_snapshot(graph, config, queries, query_index):
     """找到第 query_index 轮搜索开始之前的时间点快照。"""
     if query_index < 1 or query_index > len(queries):
         return None
+
     target_query = queries[query_index - 1]
+
     for snap in graph.get_state_history(config):
         values = snap.values or {}
         loop = values.get("research_loop_count") or 0
@@ -119,37 +119,94 @@ def find_round_snapshot(graph, config, queries, query_index):
             and values.get("search_query") == target_query
         ):
             return snap
+
     return None
 
 
-def do_follow_up(graph, store, memory, branch, query_index, follow_up):
-    """回到分支，对第 query_index 轮搜索词追问并重跑后续。"""
+def run_new_research(graph, store, memory, topic, conversation):
+    """运行一次新研究。"""
+    branch, created = store.get_or_create_by_topic(topic)
+    researcher_id = branch["researcher_id"]
+    thread_id = branch["thread_id"]
+    config = {"configurable": {"thread_id": thread_id}}
+
+    result = run_with_trace(
+        label=f"new-{researcher_id}",
+        action="new_research",
+        payload={
+            "topic": topic,
+            "researcher_id": researcher_id,
+            "reused": not created,
+        },
+        func=lambda: graph.invoke(
+            {
+                "research_topic": topic,
+                "researcher_id": researcher_id,
+                "thread_id": thread_id,
+            },
+            config=config,
+        ),
+    )
+
+    save_completed_branch(
+        store,
+        memory,
+        researcher_id,
+        thread_id,
+        topic,
+        result,
+    )
+    conversation.update_active(researcher_id, thread_id, topic)
+    return branch, result
+
+
+def run_continue_research(
+    graph,
+    store,
+    memory,
+    branch,
+    follow_up,
+    query_index=None,
+):
+    """在既有分支上继续研究。"""
     config = {"configurable": {"thread_id": branch["thread_id"]}}
-    snap = find_round_snapshot(graph, config, branch["queries"], query_index)
+
+    if query_index is None:
+        query_index = len(branch["queries"])
+    if query_index < 1:
+        query_index = 1
+
+    snap = find_round_snapshot(
+        graph,
+        config,
+        branch["queries"],
+        query_index,
+    )
     if not snap:
-        print(f"找不到第 {query_index} 轮搜索的时间点。")
-        return
-    # 第 1 步：把那一轮的搜索词替换成追问内容（改的是该时间点的状态）
-    def follow_up_job():
+        return None
+
+    def job():
         graph.update_state(
             snap.config,
             {
                 "search_query": follow_up,
                 "researcher_id": branch["researcher_id"],
+                "thread_id": branch["thread_id"],
             },
         )
         return graph.invoke(None, config=config)
 
     result = run_with_trace(
-        label=f"follow-{branch['researcher_id']}",
-        action="follow_up",
+        label=f"continue-{branch['researcher_id']}",
+        action="continue_research",
         payload={
             "researcher_id": branch["researcher_id"],
             "query_index": query_index,
             "follow_up": follow_up,
         },
-        func=follow_up_job,
+        func=job,
     )
+
     save_completed_branch(
         store,
         memory,
@@ -158,20 +215,35 @@ def do_follow_up(graph, store, memory, branch, query_index, follow_up):
         branch["topic"],
         result,
     )
-    print("=== 追问后的新版本 ===")
-    print_branch(store.get(branch["researcher_id"]))
+    return result
+
+
+def print_thinking():
+    print_agent("思考中...")
+
+
+def print_final_result(result):
+    summary = (result.get("summary") or "").strip()
+    if not summary:
+        sources = deduplicate_sources(result.get("sources_gathered", []))
+        if sources:
+            print_agent(f"参考来源：\n{sources}")
+        return
+    print_agent(summary)
+
 
 def main():
-    """程序入口：自然语言对话式研究。"""
+    """程序入口：对话式研究。"""
     with SqliteSaver.from_conn_string(
-            str(PROJECT_ROOT / "research.sqlite")
+        str(PROJECT_ROOT / "research.sqlite")
     ) as checkpointer:
         store = BranchStore(str(PROJECT_ROOT / "branches.sqlite"))
         memory = MemoryStore()
+        conversation = ConversationStore(
+            str(PROJECT_ROOT / "conversation.sqlite")
+        )
 
         model_router = ModelRouter()
-        print("模型路由:", model_router.routes)
-
         tool_registry = build_default_registry(memory)
 
         graph = DeepResearcher.build(
@@ -179,90 +251,236 @@ def main():
             tool_registry=tool_registry,
             model_router=model_router,
         )
+
+        print_agent("你好，我是研究助手。你可以直接告诉我研究主题，也可以继续追问。")
+
         while True:
-            msg = input("\n你想做什么？（""\n我可以\n 进行新的研究\n 查看过往研究\n 对过往研究追问\n  检索历史记忆\n 退出研究）").strip()
+            msg = input(INPUT_PROMPT).strip()
             if not msg:
                 continue
 
-            intent = parse_intent(model_router, msg)
-            print("解析结果:", intent.model_dump())
+            context = conversation.snapshot()
+            pending = context.get("pending_clarification")
+
+            if pending:
+                intent, remaining = resolve_clarification(
+                    model_router,
+                    store,
+                    pending,
+                    msg,
+                )
+
+                if intent is None:
+                    if remaining is None:
+                        print_agent("已取消本次追问。")
+                        conversation.clear_pending()
+                    else:
+                        conversation.set_pending(remaining)
+                        print_agent(remaining["question"])
+                        for index, option in enumerate(
+                            remaining["options"],
+                            1,
+                        ):
+                            print(f"{index}. {option}")
+                    conversation.append_turn("用户", msg)
+                    continue
+
+                conversation.clear_pending()
+            else:
+                intent = understand_message(
+                    model_router,
+                    msg,
+                    context,
+                    store.list_branches(),
+                )
+
+                if intent is None:
+                    intent = parse_intent_fallback(model_router, msg)
+
+                if intent.needs_clarification:
+                    question = (
+                        intent.clarification_question
+                        or "你指的是哪个主题？"
+                    )
+                    options = intent.clarification_options
+                    if not options:
+                        options = [
+                            branch["topic"]
+                            for branch in store.list_branches()[:5]
+                        ]
+
+                    print_agent(question)
+                    for index, option in enumerate(options, 1):
+                        print(f"{index}. {option}")
+
+                    pending_data = {
+                        "original_message": msg,
+                        "original_intent": intent.model_dump(),
+                        "question": question,
+                        "options": options,
+                        "attempts": 0,
+                    }
+                    conversation.set_pending(pending_data)
+                    conversation.append_turn("用户", msg)
+                    conversation.append_turn("Agent", question)
+                    continue
+
+            query_text = (
+                intent.standalone_query.strip()
+                or intent.follow_up.strip()
+                or intent.topic.strip()
+                or msg
+            )
+
+            branch = resolve_branch(
+                store,
+                context.get("active_researcher_id", ""),
+                query_text,
+                intent.researcher_id,
+            )
 
             if intent.action == "exit":
+                print_agent("再见。")
                 break
 
-            elif intent.action == "new_research":
-                if not intent.topic:
-                    print("请告诉我研究什么主题。")
-                    continue
-                branch, created = store.get_or_create_by_topic(intent.topic)
-                researcher_id = branch["researcher_id"]
-                thread_id = branch["thread_id"]
+            conversation.append_turn(
+                "用户",
+                msg,
+                researcher_id=branch["researcher_id"] if branch else "",
+                thread_id=branch["thread_id"] if branch else "",
+                topic=branch["topic"] if branch else "",
+            )
 
-                if created:
-                    print(f"已创建新分支 {researcher_id}（主题：{intent.topic}）")
-                else:
-                    print(f"该主题已有分支 {researcher_id}，继续在该分支上研究")
-                config = {"configurable": {"thread_id": thread_id}}
-                result = run_with_trace(
-                    label=f"new-{researcher_id}",
-                    action="new_research",
-                    payload={
-                        "topic": intent.topic,
-                        "researcher_id": researcher_id,
-                        "reused": not created,
-                    },
-                    func=lambda: graph.invoke(
-                        {
-                            "research_topic": intent.topic,
-                            "researcher_id": researcher_id,
-                        },
-                        config=config,
-                    ),
+            if intent.action == "view":
+                if not branch:
+                    print_agent("我没有找到对应的研究主题。")
+                    continue
+
+                print_agent(branch["summary"])
+                conversation.update_active(
+                    branch["researcher_id"],
+                    branch["thread_id"],
+                    branch["topic"],
                 )
-                save_completed_branch(
+                conversation.append_turn(
+                    "Agent",
+                    branch["summary"],
+                    researcher_id=branch["researcher_id"],
+                    thread_id=branch["thread_id"],
+                    topic=branch["topic"],
+                )
+                continue
+
+            if intent.action in {"recall", "answer_from_memory"}:
+                if branch:
+                    print_thinking()
+                    answer, hits = answer_from_memory(
+                        model_router,
+                        memory,
+                        branch,
+                        query_text,
+                    )
+                    if answer:
+                        print_agent(answer)
+                        conversation.append_turn(
+                            "Agent",
+                            answer,
+                            researcher_id=branch["researcher_id"],
+                            thread_id=branch["thread_id"],
+                            topic=branch["topic"],
+                        )
+                        conversation.update_active(
+                            branch["researcher_id"],
+                            branch["thread_id"],
+                            branch["topic"],
+                        )
+                        continue
+
+                    result = run_continue_research(
+                        graph,
+                        store,
+                        memory,
+                        branch,
+                        query_text,
+                    )
+                    if result:
+                        print_final_result(result)
+                        conversation.append_turn(
+                            "Agent",
+                            result.get("summary", ""),
+                            researcher_id=branch["researcher_id"],
+                            thread_id=branch["thread_id"],
+                            topic=branch["topic"],
+                        )
+                        conversation.update_active(
+                            branch["researcher_id"],
+                            branch["thread_id"],
+                            branch["topic"],
+                        )
+                        continue
+
+                print_agent("没有找到相关历史记忆。")
+                continue
+
+            if intent.action == "new_research":
+                topic = intent.topic.strip() or query_text
+                if not topic:
+                    print_agent("请告诉我研究主题。")
+                    continue
+
+                print_thinking()
+                branch, result = run_new_research(
+                    graph,
                     store,
                     memory,
-                    researcher_id,
-                    thread_id,
-                    intent.topic,
-                    result,
+                    topic,
+                    conversation,
                 )
-                print(f"已创建分支记忆 {researcher_id}")
-                print_branch(store.get(researcher_id))
-            elif intent.action == "view":
-                print_branch(store.get(intent.researcher_id))
+                print_final_result(result)
+                conversation.append_turn(
+                    "Agent",
+                    result.get("summary", ""),
+                    researcher_id=branch["researcher_id"],
+                    thread_id=branch["thread_id"],
+                    topic=branch["topic"],
+                )
+                continue
 
-            elif intent.action == "recall":
-                try:
-                    observation = run_with_trace(
-                        label=f"recall-{intent.researcher_id or 'all'}",
-                        action="recall",
-                        payload={
-                            "query": msg,
-                            "researcher_id": intent.researcher_id,
-                        },
-                        func=lambda: tool_registry.call(
-                            "recall_memory",
-                            query=msg,
-                            researcher_id=intent.researcher_id,
-                            limit=1,
-                        ),
-                    )
-                except ToolError as exc:
-                    print(f"记忆检索失败：{exc}")
-                    continue
-                print_memory_hits(observation["hits"])
-
-            elif intent.action == "follow_up":
-                branch = store.get(intent.researcher_id)
+            if intent.action in {"continue_research", "follow_up"}:
                 if not branch:
-                    print("找不到该分支。")
+                    print_agent("我没有找到对应的研究主题，请告诉我具体主题。")
                     continue
-                if intent.query_index < 1:
-                    print("请说明追问第几个搜索词，例如：追问 r1 2 祖冲之的算法")
-                    continue
-                do_follow_up(graph, store, memory, branch, intent.query_index, intent.follow_up)
+
+                print_thinking()
+                result = run_continue_research(
+                    graph,
+                    store,
+                    memory,
+                    branch,
+                    intent.follow_up.strip() or query_text,
+                    intent.query_index if intent.query_index >= 1 else None,
+                )
+
+                if result:
+                    print_final_result(result)
+                    conversation.append_turn(
+                        "Agent",
+                        result.get("summary", ""),
+                        researcher_id=branch["researcher_id"],
+                        thread_id=branch["thread_id"],
+                        topic=branch["topic"],
+                    )
+                    conversation.update_active(
+                        branch["researcher_id"],
+                        branch["thread_id"],
+                        branch["topic"],
+                    )
+                else:
+                    print_agent("找不到要追问的历史时间点。")
+                continue
+
+            print_agent("我没理解你的意思，可以换一种说法。")
 
 
 if __name__ == "__main__":
-            main()
+    main()

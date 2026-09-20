@@ -23,6 +23,10 @@ LOCAL_LLM = os.getenv("LOCAL_LLM", FAST_LLM)
 INTENT_LLM = os.getenv("INTENT_LLM", FAST_LLM)
 QUERY_LLM = os.getenv("QUERY_LLM", FAST_LLM)
 PLANNER_LLM = os.getenv("PLANNER_LLM", FAST_LLM)
+CONVERSATION_LLM = os.getenv("CONVERSATION_LLM", FAST_LLM)
+
+REVIEWER_LLM=os.getenv("REVIEWER_LLM", FAST_LLM)
+MAX_REVIEW_ROUNDS = int(os.getenv("MAX_REVIEW_ROUNDS", "1"))
 
 
 
@@ -34,8 +38,10 @@ else:
     REFLECT_LLM = os.getenv("REFLECT_LLM", FAST_LLM)
 
 MODEL_ROUTES = {
+    "conversation": CONVERSATION_LLM,
     "intent": INTENT_LLM,
     "planner": PLANNER_LLM,
+    "reviewer": REVIEWER_LLM,
     "query": QUERY_LLM,
     "summarize": SUMMARIZE_LLM,
     "reflect": REFLECT_LLM,

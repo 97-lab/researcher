@@ -20,6 +20,14 @@ class RecallMemoryParams(BaseModel):
         default="",
         description="分支编号，如 r1；空字符串表示搜索所有分支",
     )
+    thread_id: str = Field(
+        default="",
+        description="分支唯一身份证；填写后只搜索该分支",
+    )
+    kind: str = Field(
+        default="",
+        description="记忆类型，留空表示不限",
+    )
     limit: int = Field(
         default=5,
         ge=1,
@@ -68,17 +76,23 @@ def _build_recall_memory_handler(memory: MemoryStore):
     def recall_memory(
         query: str,
         researcher_id: str = "",
+        thread_id: str = "",
+        kind: str = "",
         limit: int = 5,
         min_score: float = DEFAULT_MIN_SCORE,
     ) -> dict:
         hits = memory.recall(
             query=query,
             researcher_id=researcher_id,
+            thread_id=thread_id,
+            kind=kind,
             limit=limit,
             min_score=min_score,
         )
         return {
             "query": query,
+            "researcher_id": researcher_id,
+            "thread_id": thread_id,
             "hits": hits,
             "count": len(hits),
         }

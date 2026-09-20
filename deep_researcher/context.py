@@ -6,7 +6,7 @@ from .configuration import (
     CONTEXT_MAX_OBSERVATION_CHARS,
 )
 
-
+# 怎么把信息组织给模型看
 
 class HistoryProcessor:
     """历史处理器基类：输入一组历史文本，输出处理后的历史文本。"""
@@ -163,6 +163,22 @@ class ContextBuilder:
             f"已经搜索过的词：{state.search_query_history}\n"
             f"<相关历史记忆>\n{memory_text}\n</相关历史记忆>\n\n"
             f"请检查哪些子问题还没有被充分回答，并生成追问搜索词。"
+        )
+    def build_review_human(self, state) -> str:
+        """构建“审核者节点”要发给模型的用户消息。"""
+        brief_text = self.build_brief_text(state)
+        uncovered = getattr(state, "uncovered_questions", []) or []
+        if uncovered:
+            uncovered_text = "\n".join(f"- {item}" for item in uncovered)
+        else:
+            uncovered_text = "（暂无）"
+        return (
+            f"{brief_text}\n\n"
+            f"<当前总结>\n{state.summary}\n</当前总结>\n\n"
+            f"已经搜索过的词：{state.search_query_history}\n\n"
+            f"上一次审核发现的问题：\n{uncovered_text}\n\n"
+            f"请逐项检查子问题是否已经在总结中得到回答。\n"
+            f"如果有遗漏，给出一个最关键的补充搜索词。"
         )
 
 
