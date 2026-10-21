@@ -5,7 +5,7 @@
 
 ## 当前版本亮点
 
-- 全程本地对话模型（Ollama），不依赖云端 LLM
+- 默认全程本地对话模型（Ollama），可选把指定角色切到 OpenAI 兼容的云端接口
 - LangGraph 反思循环：搜索 → 总结 → 反思 → 继续搜索或收尾
 - Tavily 联网搜索 + 相关性过滤 + 来源去重
 - 研究完成后输出最终总结和参考来源
@@ -445,10 +445,36 @@ JSON 结构化输出建议使用 `qwen2.5:3b` 等普通对话模型。
 - 编号计数器持久化；
 - `main.py` 的数据库路径固定到项目根目录。
 
+## 追问的定向回答
+
+同一个主题下的追问，不再重写整份报告：
+
+- `main.py` 调用图时传入 `is_follow_up`；
+- `graph.summarize_sources` 在追问时改用 `targeted_answer_instructions`，只回答被追问的那一点；
+- 追问结果入库时追加在原报告后面（`### 追问：...`），不会覆盖原来的完整报告；
+- 找不到历史快照（空壳分支、checkpoint 丢失）时，`restart_branch()` 会清空循环计数和审核状态、在同一分支上重跑一次，而不是直接报错。
+
+## 可选的云端模型（OpenAI 兼容）
+
+默认仍然全部走本地 Ollama；配置下面几项后，指定角色可以改走任何 OpenAI 兼容接口（DeepSeek、通义、OpenAI 等）。
+
+```ini
+CLOUD_API_BASE=https://api.deepseek.com/v1
+CLOUD_API_KEY=sk-xxxx
+CLOUD_ROLES=summarize,reflect      # 填 all 表示所有角色都走云端
+CLOUD_MODELS=summarize=deepseek-chat,default=deepseek-chat
+```
+
+- `CLOUD_API_KEY` 或 `CLOUD_API_BASE` 为空时，行为与纯本地完全一致；
+- `CLOUD_MODELS` 用 `角色=模型名` 的写法，`default=xxx` 作为兜底模型；
+- 走云端且需要 JSON 时，会带 `response_format={"type": "json_object"}`；
+- 需要额外安装：`pip install langchain-openai`（当前 `requirements.txt` 尚未包含，不配云端时不需要）。
+
 ## 当前阶段说明
 
 - Trace + Eval 已完成：每次运行写入 `runs/*.jsonl`，`eval_research.py` 负责回归；
 - 对话理解、代词消解和歧义澄清已完成代码接入；
+- 追问的定向回答与兜底重跑、可选云端模型已接入；
 - FastAPI 后端接口已经完成设计（`/chat`、`/chat/stream`、`/branches` 等），但代码尚未加入项目；
 - 下一步建议先补连续对话评测，再考虑把 FastAPI 后端落地。
 
