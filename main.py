@@ -86,10 +86,16 @@ def run_with_trace(label, action, payload, func):
     return result
 
 
-def save_completed_branch(store, memory, researcher_id, thread_id, topic, result):
-    """研究结束后双写 BranchStore 和 MemoryStore。"""
+def save_completed_branch(
+    store, memory, researcher_id, thread_id, topic, result, stored_summary=None
+):
+    """研究结束后双写 BranchStore 和 MemoryStore。
+
+    stored_summary 用于把"追问的定向回答"和原有完整报告合并后入库，
+    不传则直接存本次结果。
+    """
     queries = result.get("searched_queries", [])
-    summary = result["summary"]
+    summary = stored_summary if stored_summary is not None else result["summary"]
 
     store.save(researcher_id, thread_id, topic, queries, summary)
     memory.remember(
@@ -105,22 +111,43 @@ def save_completed_branch(store, memory, researcher_id, thread_id, topic, result
 
 
 def find_round_snapshot(graph, config, queries, query_index):
-    """找到第 query_index 轮搜索开始之前的时间点快照。"""
-    if query_index < 1 or query_index > len(queries):
+    """找到第 query_index 轮搜索开始之前的时间点快照。
+
+    锚点用「已经搜完几轮」这个计数器，而不是拿搜索词去比对字符串：
+    搜索词会被反思/审核节点改写，也可能被模型兜底替换，
+    字符串一旦对不上就整个定位失败。计数器只增不改，稳定得多。
+    """
+    history = list(graph.get_state_history(config))
+    if not history:
         return None
 
-    target_query = queries[query_index - 1]
+    total = len(queries)
 
-    for snap in graph.get_state_history(config):
-        values = snap.values or {}
-        loop = values.get("research_loop_count") or 0
-        if (
-            loop == query_index - 1
-            and values.get("search_query") == target_query
-        ):
+    # query_index 越界、缺失或非法时，一律夹回有效区间
+    if not query_index or query_index < 1:
+        query_index = total or 1
+    if total and query_index > total:
+        query_index = total
+
+    target_done = query_index - 1  # 目标快照里应当已经完成的搜索轮数
+
+    candidates = []
+    for snap in history:
+        # 只挑「下一步就去搜索」的快照，否则续接上去不会真的发起搜索
+        if "web_research" not in (snap.next or ()):
+            continue
+
+        done = len((snap.values or {}).get("searched_queries") or [])
+        if done == target_done:
             return snap
+        candidates.append((done, snap))
 
-    return None
+    if not candidates:
+        return None
+
+    # 没有精确命中时退而求其次：选已完成轮数最接近目标的那一次
+    candidates.sort(key=lambda item: abs(item[0] - target_done))
+    return candidates[0][1]
 
 
 def run_new_research(graph, store, memory, topic, conversation):
@@ -143,6 +170,7 @@ def run_new_research(graph, store, memory, topic, conversation):
                 "research_topic": topic,
                 "researcher_id": researcher_id,
                 "thread_id": thread_id,
+                "is_follow_up": False,
             },
             config=config,
         ),
@@ -182,30 +210,43 @@ def run_continue_research(
         branch["queries"],
         query_index,
     )
-    if not snap:
-        return None
 
-    def job():
-        graph.update_state(
-            snap.config,
-            {
-                "search_query": follow_up,
+    if snap:
+        def job():
+            graph.update_state(
+                snap.config,
+                {
+                    "search_query": follow_up,
+                    "researcher_id": branch["researcher_id"],
+                    "thread_id": branch["thread_id"],
+                    "is_follow_up": True,
+                },
+            )
+            return graph.invoke(None, config=config)
+
+        result = run_with_trace(
+            label=f"continue-{branch['researcher_id']}",
+            action="continue_research",
+            payload={
                 "researcher_id": branch["researcher_id"],
-                "thread_id": branch["thread_id"],
+                "query_index": query_index,
+                "follow_up": follow_up,
             },
+            func=job,
         )
-        return graph.invoke(None, config=config)
+    else:
+        # 历史节点确实找不到（空壳分支、checkpoint 丢失等）：
+        # 不直接报错，退化成在同一个分支上重新研究一次。
+        result = restart_branch(graph, branch, follow_up)
 
-    result = run_with_trace(
-        label=f"continue-{branch['researcher_id']}",
-        action="continue_research",
-        payload={
-            "researcher_id": branch["researcher_id"],
-            "query_index": query_index,
-            "follow_up": follow_up,
-        },
-        func=job,
-    )
+    answer = result.get("summary", "")
+    previous = (branch.get("summary") or "").strip()
+
+    # 追问产出的是"定向回答"，不能让它覆盖原来的完整报告，
+    # 所以入库时把两者合并：报告照旧保留，回答追加在后面。
+    stored_summary = None
+    if previous and answer and previous != answer:
+        stored_summary = f"{previous}\n\n---\n\n### 追问：{follow_up}\n\n{answer}"
 
     save_completed_branch(
         store,
@@ -214,8 +255,44 @@ def run_continue_research(
         branch["thread_id"],
         branch["topic"],
         result,
+        stored_summary=stored_summary,
     )
     return result
+
+
+def restart_branch(graph, branch, follow_up):
+    """兜底：定位不到历史节点时，在同一个分支上重跑一次研究。
+
+    把循环计数和审核状态清零，让这次重跑和一次新研究一样完整；
+    追问内容通过 search_query 带进去，第一轮搜索直接用它。
+    """
+    config = {"configurable": {"thread_id": branch["thread_id"]}}
+
+    def job():
+        return graph.invoke(
+            {
+                "research_topic": branch["topic"],
+                "researcher_id": branch["researcher_id"],
+                "thread_id": branch["thread_id"],
+                "search_query": follow_up,
+                "research_loop_count": 0,
+                "review_round": 0,
+                "review_passed": False,
+                "is_follow_up": True,
+            },
+            config=config,
+        )
+
+    return run_with_trace(
+        label=f"restart-{branch['researcher_id']}",
+        action="restart_branch",
+        payload={
+            "researcher_id": branch["researcher_id"],
+            "topic": branch["topic"],
+            "follow_up": follow_up,
+        },
+        func=job,
+    )
 
 
 def print_thinking():

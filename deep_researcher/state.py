@@ -12,6 +12,8 @@ class State:
     search_query: str = ""
     search_results: str = ""
     summary: str = ""
+    # 本次是为已有主题追问（定向回答），而不是新研究（写完整报告）
+    is_follow_up: bool = False
     research_brief: str = ""  # 规划者生成的研究简报与子问题
     sub_questions: list = field(default_factory=list)  # 规划者生成的研究简报与子问题
 

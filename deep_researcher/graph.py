@@ -17,6 +17,7 @@ from .prompts import (
     query_writer_instructions,
     reflection_instructions,
     summarizer_instructions,
+    targeted_answer_instructions,
     reviewer_instructions,
 )
 
@@ -223,8 +224,16 @@ class DeepResearcher(StateGraph):
     def summarize_sources(self, state):
         human = self.context_builder.build_summary_human(state)
 
+        # 追问走"定向回答"，只回答被问的那一点；
+        # 新研究才写完整报告。
+        instructions = (
+            targeted_answer_instructions
+            if getattr(state, "is_follow_up", False)
+            else summarizer_instructions
+        )
+
         messages = [
-            SystemMessage(content=summarizer_instructions),
+            SystemMessage(content=instructions),
             HumanMessage(content=human),
         ]
 

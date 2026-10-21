@@ -47,6 +47,16 @@ MODEL_ROUTES = {
     "reflect": REFLECT_LLM,
     "default": FAST_LLM,
 }
+# ===== 云端模型（OpenAI 兼容 API）=====
+# CLOUD_API_KEY 留空时全部走本地 Ollama，行为与改动前完全一致
+CLOUD_API_BASE = os.getenv("CLOUD_API_BASE", "")
+CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "")
+# 走云端的角色，逗号分隔；填 all 表示所有角色都走云端
+CLOUD_ROLES = os.getenv("CLOUD_ROLES", "")
+# 云端模型名，格式 "角色=模型名" 逗号分隔；
+# 写 default=xxx 表示所有走云端的角色都用这个模型
+CLOUD_MODELS = os.getenv("CLOUD_MODELS", "")
+
 # 搜索与相关性
 SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "10"))
 SEARCH_KEEP_RESULTS = int(os.getenv("SEARCH_KEEP_RESULTS", "3"))
