@@ -390,7 +390,6 @@ python -m test_scripts.memory_test
 - 上下文裁剪与历史记忆注入；
 - RAG 记忆的写入与召回。
 
-连续对话、代词消解和歧义澄清目前作为下一步评测扩展项。
 
 `eval_research`、`test_tool_registry`、`test_context` 不需要网络和 Ollama；`memory_test` 需要 Ollama 正在运行并已拉取 `qwen3-embedding:0.6b`。
 
